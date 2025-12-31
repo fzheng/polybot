@@ -21,7 +21,7 @@ pub struct StrategyLog {
 
 /// Auto trader implementing the two-leg strategy
 pub struct AutoTrader {
-    params: AutoParams,
+    params: Arc<RwLock<AutoParams>>,
     state: Arc<RwLock<StrategyState>>,
     current_round: Arc<RwLock<Option<String>>>,
     leg1_result: Arc<RwLock<Option<TradeResult>>>,
@@ -36,7 +36,7 @@ impl AutoTrader {
     /// Create a new auto trader
     pub fn new(params: AutoParams) -> Self {
         Self {
-            params,
+            params: Arc::new(RwLock::new(params)),
             state: Arc::new(RwLock::new(StrategyState::Watching)),
             current_round: Arc::new(RwLock::new(None)),
             leg1_result: Arc::new(RwLock::new(None)),
@@ -73,7 +73,9 @@ impl AutoTrader {
             "Params updated: shares={}, sum={}, move={}%, window={}min",
             params.shares, params.sum_target, params.move_pct * Decimal::ONE_HUNDRED, params.window_min
         );
-        // Note: params is owned by self, we need to handle this differently
+        let mut p = self.params.write().await;
+        *p = params;
+        drop(p);
         self.log(&msg).await;
     }
 
@@ -83,8 +85,8 @@ impl AutoTrader {
     }
 
     /// Get current parameters
-    pub fn get_params(&self) -> &AutoParams {
-        &self.params
+    pub async fn get_params(&self) -> AutoParams {
+        self.params.read().await.clone()
     }
 
     /// Get logs
@@ -145,13 +147,16 @@ impl AutoTrader {
 
     /// Watch for price dump during window
     async fn watch_for_dump(&self, watcher: &MarketWatcher) -> Result<()> {
+        let params = self.params.read().await;
+
         // Check if we're within the window
-        if !watcher.is_within_window(self.params.window_min).await {
+        if !watcher.is_within_window(params.window_min).await {
             return Ok(()); // Outside window, just wait
         }
 
         // Check for dump
-        let dump = watcher.detect_dump(3, self.params.move_pct).await; // 3 second window
+        let dump = watcher.detect_dump(3, params.move_pct).await; // 3 second window
+        drop(params);
 
         if let Some((side, pct)) = dump {
             self.log(&format!(
@@ -185,15 +190,19 @@ impl AutoTrader {
             Side::Down => watcher.get_down_price().await,
         }.ok_or_else(|| anyhow::anyhow!("No price available"))?;
 
+        let params = self.params.read().await;
+        let shares = params.shares;
+        drop(params);
+
         self.log(&format!(
             "LEG 1: Buying {} {} shares at ${:.4}",
-            self.params.shares, side, price
+            shares, side, price
         )).await;
 
         // Place order (if authenticated)
         if watcher.client().is_authenticated() {
             let result = watcher.client()
-                .buy_at_ask(token_id, self.params.shares)
+                .buy_at_ask(token_id, shares)
                 .await?;
 
             let mut leg1 = self.leg1_result.write().await;
@@ -229,11 +238,15 @@ impl AutoTrader {
         if let Some(ask) = opposite_ask {
             let sum = leg1_price + ask;
 
+            let params = self.params.read().await;
+            let sum_target = params.sum_target;
+            drop(params);
+
             // Check hedge condition
-            if sum <= self.params.sum_target {
+            if sum <= sum_target {
                 self.log(&format!(
                     "Hedge condition met! {:.4} + {:.4} = {:.4} <= {:.4}",
-                    leg1_price, ask, sum, self.params.sum_target
+                    leg1_price, ask, sum, sum_target
                 )).await;
 
                 if let Err(e) = self.execute_leg2(watcher, opposite_side, ask).await {
@@ -255,15 +268,19 @@ impl AutoTrader {
             Side::Down => &market.down_token_id,
         };
 
+        let params = self.params.read().await;
+        let shares = params.shares;
+        drop(params);
+
         self.log(&format!(
             "LEG 2: Buying {} {} shares at ${:.4}",
-            self.params.shares, side, price
+            shares, side, price
         )).await;
 
         // Place order (if authenticated)
         if watcher.client().is_authenticated() {
             let result = watcher.client()
-                .buy_at_ask(token_id, self.params.shares)
+                .buy_at_ask(token_id, shares)
                 .await?;
 
             let mut leg2 = self.leg2_result.write().await;
@@ -275,8 +292,8 @@ impl AutoTrader {
         // Calculate profit
         let leg1 = self.leg1_result.read().await;
         if let Some(l1) = leg1.as_ref() {
-            let total_cost = l1.price * self.params.shares + price * self.params.shares;
-            let payout = self.params.shares; // $1 per share pair
+            let total_cost = l1.price * shares + price * shares;
+            let payout = shares; // $1 per share pair
             let profit = payout - total_cost;
             let profit_pct = (profit / total_cost) * Decimal::ONE_HUNDRED;
 

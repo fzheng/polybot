@@ -3,7 +3,7 @@
 #![allow(dead_code)]
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Timelike, Utc};
 use reqwest::Client;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -37,26 +37,45 @@ struct MarketsResponse {
     next_cursor: Option<String>,
 }
 
+/// Event data from the events endpoint
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
-struct MarketData {
-    condition_id: String,
-    question_id: String,
-    question: String,
+struct EventData {
     slug: String,
-    tokens: Vec<TokenData>,
-    end_date_iso: Option<String>,
-    game_start_time: Option<String>,
+    title: String,
     #[serde(default)]
     active: bool,
     #[serde(default)]
     closed: bool,
+    #[serde(default)]
+    markets: Vec<MarketData>,
 }
 
 #[derive(Debug, Deserialize)]
-struct TokenData {
-    token_id: String,
-    outcome: String,
+#[allow(dead_code)]
+struct MarketData {
+    #[serde(rename = "conditionId")]
+    condition_id: String,
+    #[serde(rename = "questionID")]
+    question_id: Option<String>,
+    question: String,
+    slug: String,
+    /// Token IDs as JSON array string e.g. "[\"abc\", \"def\"]"
+    #[serde(rename = "clobTokenIds", default)]
+    clob_token_ids: Option<String>,
+    /// Outcomes as JSON array string e.g. "[\"Yes\", \"No\"]"
+    #[serde(default)]
+    outcomes: Option<String>,
+    #[serde(rename = "endDateIso")]
+    end_date_iso: Option<String>,
+    #[serde(rename = "endDate")]
+    end_date: Option<String>,
+    #[serde(rename = "startDateIso")]
+    start_date_iso: Option<String>,
+    #[serde(default)]
+    active: bool,
+    #[serde(default)]
+    closed: bool,
 }
 
 /// Order book response
@@ -118,8 +137,13 @@ struct OrderResponse {
 impl PolymarketClient {
     /// Create a new client
     pub fn new(config: &Config) -> Self {
+        let client = Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .expect("Failed to build HTTP client");
+
         Self {
-            client: Client::new(),
+            client,
             clob_endpoint: config.api.clob_endpoint.clone(),
             gamma_endpoint: config.api.gamma_endpoint.clone(),
             api_key: None,
@@ -159,32 +183,64 @@ impl PolymarketClient {
 
     /// Get current BTC 15-minute UP/DOWN market
     pub async fn get_btc_market(&self) -> Result<Option<MarketInfo>> {
-        // Search for active BTC 15-minute markets
+        // Calculate the expected slug based on current time
+        // BTC 15-min markets run from :00-:15, :15-:30, :30-:45, :45-:00
+        // The slug contains the Unix timestamp of the START time
+        // So at 6:04 UTC, we look for the market that started at 6:00 UTC
+        let now = Utc::now();
+        let current_minute = now.minute();
+
+        // Find the most recent 15-minute boundary (start time of current round)
+        let minutes_since_boundary = current_minute % 15;
+        let start_time = now - chrono::Duration::minutes(minutes_since_boundary as i64);
+        // Truncate to exact minute
+        let start_time = start_time
+            .with_second(0).unwrap()
+            .with_nanosecond(0).unwrap();
+        let end_time = start_time + chrono::Duration::minutes(15);
+
+        let start_timestamp = start_time.timestamp();
+        let expected_slug = format!("btc-updown-15m-{}", start_timestamp);
+
+        tracing::debug!(
+            "Current time: {}, expecting market slug: {} (starts at {}, ends at {})",
+            now.format("%H:%M:%S"),
+            expected_slug,
+            start_time.format("%H:%M:%S"),
+            end_time.format("%H:%M:%S")
+        );
+
+        // Query directly for this specific market
         let url = format!(
-            "{}/markets?active=true&closed=false&limit=100",
-            self.gamma_endpoint
+            "{}/events?slug={}",
+            self.gamma_endpoint,
+            expected_slug
         );
 
         let resp = self.client.get(&url).send().await?;
 
         if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Failed to get markets: {} - {}", status, body);
+            tracing::debug!("Market {} not found, trying search", expected_slug);
+            return Ok(None);
         }
 
-        let markets: Vec<MarketData> = resp.json().await?;
+        let events: Vec<EventData> = resp.json().await?;
 
-        // Find BTC 15-minute UP/DOWN market
-        for market in markets {
-            let slug_lower = market.slug.to_lowercase();
-            if slug_lower.contains("bitcoin") && slug_lower.contains("15") {
+        if let Some(event) = events.into_iter().next() {
+            if let Some(market) = event.markets.into_iter().next() {
                 if let Some(market_info) = self.parse_btc_market(&market) {
+                    tracing::info!(
+                        "Found market: {} (ends at {}, {} seconds remaining)",
+                        market_info.slug,
+                        market_info.end_time.format("%H:%M:%S"),
+                        market_info.seconds_remaining()
+                    );
                     return Ok(Some(market_info));
                 }
             }
         }
 
+        tracing::debug!("No active BTC 15-minute market found for slug {}", expected_slug);
         Ok(None)
     }
 
@@ -215,15 +271,30 @@ impl PolymarketClient {
     }
 
     fn parse_btc_market(&self, market: &MarketData) -> Option<MarketInfo> {
+        // Parse token IDs from JSON string (e.g. "[\"abc\", \"def\"]")
+        let token_ids: Vec<String> = market.clob_token_ids.as_ref()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_default();
+
+        // Parse outcomes from JSON string (e.g. "[\"Yes\", \"No\"]" or "[\"Up\", \"Down\"]")
+        let outcomes: Vec<String> = market.outcomes.as_ref()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_default();
+
+        if token_ids.len() != 2 || outcomes.len() != 2 {
+            return None;
+        }
+
+        // Match outcomes to tokens
         let mut up_token_id = None;
         let mut down_token_id = None;
 
-        for token in &market.tokens {
-            let outcome_lower = token.outcome.to_lowercase();
+        for (i, outcome) in outcomes.iter().enumerate() {
+            let outcome_lower = outcome.to_lowercase();
             if outcome_lower.contains("up") || outcome_lower == "yes" {
-                up_token_id = Some(token.token_id.clone());
+                up_token_id = Some(token_ids[i].clone());
             } else if outcome_lower.contains("down") || outcome_lower == "no" {
-                down_token_id = Some(token.token_id.clone());
+                down_token_id = Some(token_ids[i].clone());
             }
         }
 
@@ -232,19 +303,30 @@ impl PolymarketClient {
             _ => return None,
         };
 
-        // Parse end time
-        let end_time = market.end_date_iso.as_ref()
-            .or(market.game_start_time.as_ref())
+        // Parse start time from slug timestamp (slug format: btc-updown-15m-{start_timestamp})
+        let start_time = market.start_date_iso.as_ref()
             .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
             .map(|dt| dt.with_timezone(&Utc))
-            .unwrap_or_else(|| Utc::now() + chrono::Duration::minutes(15));
+            .or_else(|| {
+                // Extract Unix timestamp from slug like "btc-updown-15m-1767246300"
+                // This timestamp represents the START time of the 15-minute window
+                market.slug.split('-').last()
+                    .and_then(|ts| ts.parse::<i64>().ok())
+                    .and_then(|ts| DateTime::from_timestamp(ts, 0))
+                    .map(|dt| dt.with_timezone(&Utc))
+            })
+            .unwrap_or_else(|| Utc::now());
 
-        // Estimate start time (15 minutes before end for 15-min markets)
-        let start_time = end_time - chrono::Duration::minutes(15);
+        // End time is 15 minutes after start time
+        let end_time = market.end_date_iso.as_ref()
+            .or(market.end_date.as_ref())
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.with_timezone(&Utc))
+            .unwrap_or_else(|| start_time + chrono::Duration::minutes(15));
 
         Some(MarketInfo {
             condition_id: market.condition_id.clone(),
-            question_id: market.question_id.clone(),
+            question_id: market.question_id.clone().unwrap_or_default(),
             slug: market.slug.clone(),
             up_token_id,
             down_token_id,

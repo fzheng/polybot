@@ -26,35 +26,47 @@ pub struct PriceUpdate {
     pub timestamp: chrono::DateTime<Utc>,
 }
 
-/// WebSocket message types
+/// WebSocket subscription message (CLOB market channel format)
 #[derive(Debug, Serialize)]
-#[serde(tag = "type")]
-#[allow(dead_code)]
-enum WsRequest {
-    #[serde(rename = "subscribe")]
-    Subscribe { channel: String, assets_ids: Vec<String> },
-    #[serde(rename = "unsubscribe")]
-    Unsubscribe { channel: String, assets_ids: Vec<String> },
+struct WsSubscription {
+    assets_ids: Vec<String>,
+    #[serde(rename = "type")]
+    sub_type: String,
 }
 
+/// Incoming WebSocket message types
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 struct WsMessage {
-    #[serde(rename = "type")]
-    msg_type: Option<String>,
-    channel: Option<String>,
+    event_type: Option<String>,
     asset_id: Option<String>,
-    data: Option<WsData>,
+    market: Option<String>,
+    timestamp: Option<String>,
+    hash: Option<String>,
+    // For book events
+    bids: Option<Vec<BookLevel>>,
+    asks: Option<Vec<BookLevel>>,
+    // For price_change events
+    price_changes: Option<Vec<PriceChange>>,
+    // For last_trade_price events
+    price: Option<String>,
+    side: Option<String>,
+    size: Option<String>,
+    // For best_bid_ask events
+    best_bid: Option<String>,
+    best_ask: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
-struct WsData {
-    bids: Option<Vec<BookLevel>>,
-    asks: Option<Vec<BookLevel>>,
+struct PriceChange {
+    asset_id: String,
     price: Option<String>,
-    side: Option<String>,
     size: Option<String>,
+    side: Option<String>,
+    hash: Option<String>,
+    best_bid: Option<String>,
+    best_ask: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -183,22 +195,29 @@ impl PriceStream {
         update_tx: broadcast::Sender<PriceUpdate>,
         running: Arc<RwLock<bool>>,
     ) -> Result<()> {
-        let (ws_stream, _) = connect_async(ws_url)
+        tracing::info!("Connecting to WebSocket: {}", ws_url);
+        tracing::info!("Token IDs to subscribe: {:?}", token_ids);
+
+        let (ws_stream, response) = connect_async(ws_url)
             .await
             .context("Failed to connect to WebSocket")?;
 
+        tracing::info!("WebSocket connected! Response status: {:?}", response.status());
+
         let (mut write, mut read) = ws_stream.split();
 
-        // Subscribe to price updates
-        let subscribe_msg = WsRequest::Subscribe {
-            channel: "book".to_string(),
+        // Subscribe to market data for each token
+        // CLOB format: {"assets_ids":["token_id_1","token_id_2"],"type":"market"}
+        let subscribe_msg = WsSubscription {
             assets_ids: token_ids.to_vec(),
+            sub_type: "market".to_string(),
         };
 
         let msg = serde_json::to_string(&subscribe_msg)?;
+        tracing::info!("Sending WebSocket subscription: {}", msg);
         write.send(Message::Text(msg.into())).await?;
 
-        tracing::info!("Subscribed to {} token(s)", token_ids.len());
+        tracing::info!("Subscribed to {} token(s), waiting for messages...", token_ids.len());
 
         // Track last price entry for deduplication
         let mut last_up_ask: Option<Decimal> = None;
@@ -214,52 +233,94 @@ impl PriceStream {
 
             match msg {
                 Ok(Message::Text(text)) => {
-                    if let Ok(ws_msg) = serde_json::from_str::<WsMessage>(&text) {
-                        if let Some(asset_id) = &ws_msg.asset_id {
-                            if let Some(data) = &ws_msg.data {
-                                let mut best_bid = None;
-                                let mut best_ask = None;
-                                let mut bid_size = None;
-                                let mut ask_size = None;
+                    // Log messages for debugging
+                    tracing::debug!("WS received: {}", &text[..text.len().min(500)]);
 
-                                if let Some(bids) = &data.bids {
-                                    if let Some(top) = bids.first() {
-                                        best_bid = top.price.parse().ok();
-                                        bid_size = top.size.parse().ok();
+                    // Try to parse as array first (server sends arrays of messages)
+                    let messages: Vec<WsMessage> = if let Ok(arr) = serde_json::from_str::<Vec<WsMessage>>(&text) {
+                        arr
+                    } else if let Ok(single) = serde_json::from_str::<WsMessage>(&text) {
+                        vec![single]
+                    } else {
+                        tracing::warn!("Failed to parse WS message: {}", &text[..text.len().min(100)]);
+                        continue;
+                    };
+
+                    for ws_msg in messages {
+                        let event_type = ws_msg.event_type.as_deref().unwrap_or("book");
+
+                        match event_type {
+                            "book" => {
+                                // Full order book snapshot (initial or update)
+                                if let Some(asset_id) = &ws_msg.asset_id {
+                                    let mut best_bid = None;
+                                    let mut best_ask = None;
+                                    let mut bid_size = None;
+                                    let mut ask_size = None;
+
+                                    // Find best (highest) bid
+                                    if let Some(bids) = &ws_msg.bids {
+                                        if let Some(top) = bids.iter()
+                                            .filter_map(|b| b.price.parse::<Decimal>().ok().map(|p| (p, &b.size)))
+                                            .max_by_key(|(p, _)| *p) {
+                                            best_bid = Some(top.0);
+                                            bid_size = top.1.parse().ok();
+                                        }
+                                    }
+
+                                    // Find best (lowest) ask
+                                    if let Some(asks) = &ws_msg.asks {
+                                        if let Some(top) = asks.iter()
+                                            .filter_map(|a| a.price.parse::<Decimal>().ok().map(|p| (p, &a.size)))
+                                            .min_by_key(|(p, _)| *p) {
+                                            best_ask = Some(top.0);
+                                            ask_size = top.1.parse().ok();
+                                        }
+                                    }
+
+                                    if best_bid.is_some() || best_ask.is_some() {
+                                        tracing::info!("Book update for {}: bid={:?}, ask={:?}",
+                                            &asset_id[..8], best_bid, best_ask);
+                                        Self::update_book(
+                                            &order_books, &update_tx, asset_id,
+                                            best_bid, best_ask, bid_size, ask_size
+                                        ).await;
                                     }
                                 }
+                            }
+                            "price_change" => {
+                                // Price change with best bid/ask
+                                if let Some(changes) = &ws_msg.price_changes {
+                                    for change in changes {
+                                        let best_bid = change.best_bid.as_ref()
+                                            .and_then(|s| s.parse().ok());
+                                        let best_ask = change.best_ask.as_ref()
+                                            .and_then(|s| s.parse().ok());
 
-                                if let Some(asks) = &data.asks {
-                                    if let Some(top) = asks.first() {
-                                        best_ask = top.price.parse().ok();
-                                        ask_size = top.size.parse().ok();
+                                        Self::update_book(
+                                            &order_books, &update_tx, &change.asset_id,
+                                            best_bid, best_ask, None, None
+                                        ).await;
                                     }
                                 }
+                            }
+                            "best_bid_ask" => {
+                                // Direct best bid/ask update
+                                if let Some(asset_id) = &ws_msg.asset_id {
+                                    let best_bid = ws_msg.best_bid.as_ref()
+                                        .and_then(|s| s.parse().ok());
+                                    let best_ask = ws_msg.best_ask.as_ref()
+                                        .and_then(|s| s.parse().ok());
 
-                                // Update order book
-                                {
-                                    let mut books = order_books.write().await;
-                                    let book = books.entry(asset_id.clone()).or_default();
-                                    if best_bid.is_some() {
-                                        book.best_bid = best_bid;
-                                        book.bid_size = bid_size;
-                                    }
-                                    if best_ask.is_some() {
-                                        book.best_ask = best_ask;
-                                        book.ask_size = ask_size;
-                                    }
+                                    Self::update_book(
+                                        &order_books, &update_tx, asset_id,
+                                        best_bid, best_ask, None, None
+                                    ).await;
                                 }
-
-                                // Send update
-                                let update = PriceUpdate {
-                                    token_id: asset_id.clone(),
-                                    best_bid,
-                                    best_ask,
-                                    bid_size,
-                                    ask_size,
-                                    timestamp: Utc::now(),
-                                };
-                                let _ = update_tx.send(update);
+                            }
+                            _ => {
+                                // Ignore other event types
+                                tracing::trace!("Ignoring event type: {}", event_type);
                             }
                         }
                     }
@@ -311,6 +372,42 @@ impl PriceStream {
         }
 
         Ok(())
+    }
+
+    /// Helper to update order book and send notification
+    async fn update_book(
+        order_books: &Arc<RwLock<HashMap<String, OrderBook>>>,
+        update_tx: &broadcast::Sender<PriceUpdate>,
+        asset_id: &str,
+        best_bid: Option<Decimal>,
+        best_ask: Option<Decimal>,
+        bid_size: Option<Decimal>,
+        ask_size: Option<Decimal>,
+    ) {
+        // Update order book
+        {
+            let mut books = order_books.write().await;
+            let book = books.entry(asset_id.to_string()).or_default();
+            if best_bid.is_some() {
+                book.best_bid = best_bid;
+                book.bid_size = bid_size;
+            }
+            if best_ask.is_some() {
+                book.best_ask = best_ask;
+                book.ask_size = ask_size;
+            }
+        }
+
+        // Send update notification
+        let update = PriceUpdate {
+            token_id: asset_id.to_string(),
+            best_bid,
+            best_ask,
+            bid_size,
+            ask_size,
+            timestamp: Utc::now(),
+        };
+        let _ = update_tx.send(update);
     }
 
     /// Stop the price stream

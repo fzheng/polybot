@@ -36,14 +36,21 @@ impl MarketWatcher {
 
     /// Initialize and start watching
     pub async fn start(&mut self) -> Result<()> {
+        tracing::info!("Searching for active BTC markets...");
+
         // Find current BTC market
         self.refresh_market().await?;
 
         // Start price stream if we have a market
         let market = self.current_market.read().await;
         if let Some(m) = market.as_ref() {
+            tracing::info!("Starting price stream for market: {}", m.slug);
+            tracing::info!("UP token ID: {}", m.up_token_id);
+            tracing::info!("DOWN token ID: {}", m.down_token_id);
             let tokens = vec![m.up_token_id.clone(), m.down_token_id.clone()];
             self.price_stream.start(tokens).await?;
+        } else {
+            tracing::warn!("No active BTC 15-minute market found - will retry on tick");
         }
 
         Ok(())

@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -42,6 +42,9 @@ pub struct App {
     // Cached state for UI
     cached_balance: Decimal,
     cached_pnl: Decimal,
+    cached_auto_enabled: bool,
+    cached_market_slug: Option<String>,
+    cached_seconds_remaining: Option<i64>,
 }
 
 impl App {
@@ -86,24 +89,32 @@ impl App {
             last_down_price: None,
             cached_balance: starting_balance,
             cached_pnl: Decimal::ZERO,
+            cached_auto_enabled: false,
+            cached_market_slug: None,
+            cached_seconds_remaining: None,
             config,
         })
     }
 
     /// Run the application
     pub async fn run(&mut self) -> Result<()> {
-        // Initialize market watcher
-        self.log("Connecting to Polymarket...");
-        if let Err(e) = self.watcher.start().await {
-            self.log(&format!("Warning: {}", e));
-        }
-
-        // Setup terminal
+        // Setup terminal first so user sees progress
         enable_raw_mode()?;
         let mut stdout = io::stdout();
         execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
+
+        // Show initial UI with connecting message
+        self.log("Connecting to Polymarket...");
+        terminal.draw(|f| ui::draw(f, self))?;
+
+        // Initialize market watcher
+        if let Err(e) = self.watcher.start().await {
+            self.log(&format!("Warning: {}", e));
+        } else {
+            self.log("Connected!");
+        }
 
         // Main loop
         let tick_rate = Duration::from_millis(100);
@@ -117,6 +128,10 @@ impl App {
             let timeout = tick_rate.saturating_sub(last_tick.elapsed());
             if crossterm::event::poll(timeout)? {
                 if let Event::Key(key) = event::read()? {
+                    // Only handle key press events (not release) to avoid double input on Windows
+                    if key.kind != KeyEventKind::Press {
+                        continue;
+                    }
                     match key.code {
                         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             self.should_quit = true;
@@ -177,6 +192,18 @@ impl App {
                 }
             }
         }
+
+        // Update cached market info for UI
+        if let Some(m) = self.watcher.get_current_market().await {
+            self.cached_market_slug = Some(m.slug.clone());
+            self.cached_seconds_remaining = Some(m.seconds_remaining());
+        } else {
+            self.cached_market_slug = None;
+            self.cached_seconds_remaining = None;
+        }
+
+        // Update cached auto_enabled for UI
+        self.cached_auto_enabled = self.auto_trader.is_enabled().await;
 
         // Update prices
         self.last_up_price = self.watcher.get_up_price().await;
@@ -449,6 +476,15 @@ impl App {
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(2u32);
 
+                // Update the params
+                let new_params = AutoParams {
+                    shares,
+                    sum_target: sum,
+                    move_pct,
+                    window_min: window,
+                };
+                self.auto_trader.set_params(new_params).await;
+
                 self.log(&format!(
                     "Auto ON: {} shares, sum={}, move={}%, window={}min",
                     shares, sum, move_pct * Decimal::ONE_HUNDRED, window
@@ -467,7 +503,7 @@ impl App {
     }
 
     async fn show_params(&mut self) {
-        let params = self.auto_trader.get_params().clone();
+        let params = self.auto_trader.get_params().await;
         self.log("Current parameters:");
         self.log(&format!("  shares:    {}", params.shares));
         self.log(&format!("  sum:       {}", params.sum_target));
@@ -633,16 +669,15 @@ impl App {
     }
 
     pub fn auto_enabled(&self) -> bool {
-        // Sync check - use cached value for UI
-        false // TODO: Cache this
+        self.cached_auto_enabled
     }
 
     pub fn market_slug(&self) -> Option<String> {
-        None // TODO: Cache this
+        self.cached_market_slug.clone()
     }
 
     pub fn seconds_remaining(&self) -> Option<i64> {
-        None // TODO: Cache this
+        self.cached_seconds_remaining
     }
 
     pub fn recorder_snapshots(&self) -> u64 {
