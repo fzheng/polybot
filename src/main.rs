@@ -1,3 +1,32 @@
+//! PolyBot - Automated Polymarket Trading Bot
+//!
+//! A trading bot for Polymarket's BTC 15-minute UP/DOWN prediction markets,
+//! implementing a two-leg arbitrage strategy.
+//!
+//! # Quick Start
+//!
+//! ```bash
+//! # Paper trading mode (default, safe)
+//! cargo run --release
+//!
+//! # With verbose logging to file
+//! cargo run --release -- --verbose --log-file polybot.log
+//!
+//! # Record-only mode (no trading)
+//! cargo run --release -- --record-only
+//! ```
+//!
+//! # Architecture
+//!
+//! - [`api`] - Polymarket REST and WebSocket clients
+//! - [`config`] - Configuration management (TOML + env vars)
+//! - [`market`] - Market monitoring and round tracking
+//! - [`strategy`] - Two-leg arbitrage strategy
+//! - [`paper`] - Paper trading simulation
+//! - [`recorder`] - Price data recording for backtesting
+//! - [`terminal`] - Terminal UI and command handling
+//! - [`types`] - Core data structures
+
 mod api;
 mod config;
 mod market;
@@ -14,36 +43,48 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use crate::config::Config;
 use crate::terminal::App;
 
+/// Command-line arguments for PolyBot.
 #[derive(Parser, Debug)]
 #[command(name = "polybot")]
 #[command(about = "Automated Polymarket trading bot for BTC 15-minute UP/DOWN markets")]
+#[command(version)]
 struct Args {
-    /// Enable verbose logging
+    /// Enable verbose (debug) logging.
+    /// Use with --log-file to capture detailed logs.
     #[arg(short, long)]
     verbose: bool,
 
-    /// Path to config file
+    /// Path to configuration file.
+    /// Defaults to config.toml in current directory.
     #[arg(short, long, default_value = "config.toml")]
     config: String,
 
-    /// Run in record-only mode (no trading, just data collection)
+    /// Run in record-only mode.
+    /// Collects price data without executing any trades.
+    /// Useful for backtesting data collection.
     #[arg(long)]
     record_only: bool,
 
-    /// Log to file instead of hiding logs (for debugging)
+    /// Log to file instead of suppressing logs.
+    /// Console logging is disabled by default because it
+    /// interferes with the terminal UI.
     #[arg(long)]
     log_file: Option<String>,
 }
 
+/// Application entry point.
+///
+/// Initializes logging, loads configuration, and runs the terminal application.
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    // Load environment variables
+    // Load environment variables from .env file
     dotenvy::dotenv().ok();
 
-    // Initialize logging - write to file if specified, otherwise disable console logging
-    // (console logging interferes with the TUI)
+    // Initialize logging
+    // Console logging is disabled by default (interferes with TUI)
+    // Use --log-file to enable file logging for debugging
     let log_level = if args.verbose { "debug" } else { "info" };
 
     if let Some(log_path) = &args.log_file {
@@ -71,7 +112,7 @@ async fn main() -> Result<()> {
             .init();
     }
 
-    // Load configuration
+    // Load configuration from file and environment
     let config = Config::load(&args.config)?;
 
     // Run the terminal application

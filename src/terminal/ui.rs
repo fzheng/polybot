@@ -94,10 +94,10 @@ fn draw_prices(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_status(f: &mut Frame, app: &App, area: Rect) {
-    let auto_status = if app.auto_enabled() {
-        Span::styled("ON", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
+    let mode_status = if app.is_paper_mode() {
+        Span::styled("PAPER", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
     } else {
-        Span::styled("OFF", Style::default().fg(Color::Red))
+        Span::styled("LIVE", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
     };
 
     let snapshots = app.recorder_snapshots();
@@ -120,8 +120,8 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
             ),
         ]),
         Line::from(vec![
-            Span::raw("Auto:   "),
-            auto_status,
+            Span::raw("Mode:   "),
+            mode_status,
         ]),
     ];
 

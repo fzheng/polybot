@@ -9,6 +9,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use crate::market::MarketWatcher;
+use crate::paper::PaperTrader;
 use crate::types::{AutoParams, Side, StrategyState, TradeResult};
 
 /// Log entry for strategy actions
@@ -19,15 +20,24 @@ pub struct StrategyLog {
     pub is_error: bool,
 }
 
+/// Leg 1 trade info for tracking
+#[derive(Debug, Clone)]
+pub struct Leg1Info {
+    pub side: Side,
+    pub price: Decimal,
+    pub shares: Decimal,
+    pub token_id: String,
+}
+
 /// Auto trader implementing the two-leg strategy
 pub struct AutoTrader {
     params: Arc<RwLock<AutoParams>>,
     state: Arc<RwLock<StrategyState>>,
     current_round: Arc<RwLock<Option<String>>>,
+    leg1_info: Arc<RwLock<Option<Leg1Info>>>,
     leg1_result: Arc<RwLock<Option<TradeResult>>>,
     leg2_result: Arc<RwLock<Option<TradeResult>>>,
     logs: Arc<RwLock<Vec<StrategyLog>>>,
-    enabled: Arc<RwLock<bool>>,
     total_profit: Arc<RwLock<Decimal>>,
     cycles_completed: Arc<RwLock<u32>>,
 }
@@ -39,32 +49,13 @@ impl AutoTrader {
             params: Arc::new(RwLock::new(params)),
             state: Arc::new(RwLock::new(StrategyState::Watching)),
             current_round: Arc::new(RwLock::new(None)),
+            leg1_info: Arc::new(RwLock::new(None)),
             leg1_result: Arc::new(RwLock::new(None)),
             leg2_result: Arc::new(RwLock::new(None)),
             logs: Arc::new(RwLock::new(Vec::new())),
-            enabled: Arc::new(RwLock::new(false)),
             total_profit: Arc::new(RwLock::new(Decimal::ZERO)),
             cycles_completed: Arc::new(RwLock::new(0)),
         }
-    }
-
-    /// Enable auto trading
-    pub async fn enable(&self) {
-        let mut enabled = self.enabled.write().await;
-        *enabled = true;
-        self.log("Auto trading ENABLED").await;
-    }
-
-    /// Disable auto trading
-    pub async fn disable(&self) {
-        let mut enabled = self.enabled.write().await;
-        *enabled = false;
-        self.log("Auto trading DISABLED").await;
-    }
-
-    /// Check if auto trading is enabled
-    pub async fn is_enabled(&self) -> bool {
-        *self.enabled.read().await
     }
 
     /// Update parameters
@@ -105,11 +96,8 @@ impl AutoTrader {
     }
 
     /// Process a tick - called regularly to update strategy
-    pub async fn tick(&self, watcher: &MarketWatcher) -> Result<()> {
-        if !self.is_enabled().await {
-            return Ok(());
-        }
-
+    /// paper_trader: Used for paper trading mode, None for live trading
+    pub async fn tick(&self, watcher: &MarketWatcher, paper_trader: Option<&PaperTrader>) -> Result<()> {
         // Check if round changed
         let current_market = watcher.get_current_market().await;
         let current_slug = current_market.as_ref().map(|m| m.slug.clone());
@@ -120,6 +108,11 @@ impl AutoTrader {
                 // Round changed - abandon current cycle
                 if round.is_some() && self.get_state().await != StrategyState::Watching {
                     self.log("Round changed - abandoning cycle").await;
+                    if let Some(pt) = paper_trader {
+                        if let Some(slug) = round.as_ref() {
+                            pt.abandon_cycle(slug).await;
+                        }
+                    }
                     self.reset_cycle().await;
                 }
                 *round = current_slug.clone();
@@ -131,10 +124,10 @@ impl AutoTrader {
 
         match state {
             StrategyState::Watching => {
-                self.watch_for_dump(watcher).await?;
+                self.watch_for_dump(watcher, paper_trader).await?;
             }
             StrategyState::WaitingForHedge { leg1_side, leg1_price } => {
-                self.watch_for_hedge(watcher, leg1_side, leg1_price).await?;
+                self.watch_for_hedge(watcher, paper_trader, leg1_side, leg1_price).await?;
             }
             StrategyState::Completed | StrategyState::Abandoned => {
                 // Reset for next cycle
@@ -146,7 +139,7 @@ impl AutoTrader {
     }
 
     /// Watch for price dump during window
-    async fn watch_for_dump(&self, watcher: &MarketWatcher) -> Result<()> {
+    async fn watch_for_dump(&self, watcher: &MarketWatcher, paper_trader: Option<&PaperTrader>) -> Result<()> {
         let params = self.params.read().await;
 
         // Check if we're within the window
@@ -166,7 +159,7 @@ impl AutoTrader {
             )).await;
 
             // Execute Leg 1
-            if let Err(e) = self.execute_leg1(watcher, side).await {
+            if let Err(e) = self.execute_leg1(watcher, paper_trader, side).await {
                 self.log_error(&format!("Leg 1 failed: {}", e)).await;
             }
         }
@@ -175,7 +168,7 @@ impl AutoTrader {
     }
 
     /// Execute Leg 1 - buy the side that dumped
-    async fn execute_leg1(&self, watcher: &MarketWatcher, side: Side) -> Result<()> {
+    async fn execute_leg1(&self, watcher: &MarketWatcher, paper_trader: Option<&PaperTrader>, side: Side) -> Result<()> {
         let market = watcher.get_current_market().await
             .ok_or_else(|| anyhow::anyhow!("No active market"))?;
 
@@ -199,16 +192,37 @@ impl AutoTrader {
             shares, side, price
         )).await;
 
-        // Place order (if authenticated)
-        if watcher.client().is_authenticated() {
+        // Execute trade based on mode
+        if let Some(pt) = paper_trader {
+            // Paper trading mode
+            let result = pt.buy(token_id, side, shares, price, &market.slug).await?;
+            let mut leg1 = self.leg1_result.write().await;
+            *leg1 = Some(result);
+            self.log("[PAPER] Leg 1 executed").await;
+        } else if watcher.client().is_authenticated() {
+            // Live trading mode - check balance first
+            // TODO: Add balance check via API
             let result = watcher.client()
                 .buy_at_ask(token_id, shares)
                 .await?;
 
             let mut leg1 = self.leg1_result.write().await;
             *leg1 = Some(result);
+            self.log("[LIVE] Leg 1 executed").await;
         } else {
-            self.log("(Simulated - not authenticated)").await;
+            self.log_error("Not authenticated for live trading and no paper trader").await;
+            return Ok(());
+        }
+
+        // Store leg1 info for profit calculation
+        {
+            let mut leg1_info = self.leg1_info.write().await;
+            *leg1_info = Some(Leg1Info {
+                side,
+                price,
+                shares,
+                token_id: token_id.clone(),
+            });
         }
 
         // Update state
@@ -225,6 +239,7 @@ impl AutoTrader {
     async fn watch_for_hedge(
         &self,
         watcher: &MarketWatcher,
+        paper_trader: Option<&PaperTrader>,
         leg1_side: Side,
         leg1_price: Decimal,
     ) -> Result<()> {
@@ -249,7 +264,7 @@ impl AutoTrader {
                     leg1_price, ask, sum, sum_target
                 )).await;
 
-                if let Err(e) = self.execute_leg2(watcher, opposite_side, ask).await {
+                if let Err(e) = self.execute_leg2(watcher, paper_trader, opposite_side, ask).await {
                     self.log_error(&format!("Leg 2 failed: {}", e)).await;
                 }
             }
@@ -259,7 +274,7 @@ impl AutoTrader {
     }
 
     /// Execute Leg 2 - hedge by buying opposite side
-    async fn execute_leg2(&self, watcher: &MarketWatcher, side: Side, price: Decimal) -> Result<()> {
+    async fn execute_leg2(&self, watcher: &MarketWatcher, paper_trader: Option<&PaperTrader>, side: Side, price: Decimal) -> Result<()> {
         let market = watcher.get_current_market().await
             .ok_or_else(|| anyhow::anyhow!("No active market"))?;
 
@@ -277,29 +292,43 @@ impl AutoTrader {
             shares, side, price
         )).await;
 
-        // Place order (if authenticated)
-        if watcher.client().is_authenticated() {
+        // Execute trade based on mode
+        if let Some(pt) = paper_trader {
+            // Paper trading mode
+            let result = pt.buy(token_id, side, shares, price, &market.slug).await?;
+            let mut leg2 = self.leg2_result.write().await;
+            *leg2 = Some(result);
+            self.log("[PAPER] Leg 2 executed").await;
+        } else if watcher.client().is_authenticated() {
+            // Live trading mode
             let result = watcher.client()
                 .buy_at_ask(token_id, shares)
                 .await?;
 
             let mut leg2 = self.leg2_result.write().await;
             *leg2 = Some(result);
+            self.log("[LIVE] Leg 2 executed").await;
         } else {
-            self.log("(Simulated - not authenticated)").await;
+            self.log_error("Not authenticated for live trading and no paper trader").await;
+            return Ok(());
         }
 
-        // Calculate profit
-        let leg1 = self.leg1_result.read().await;
-        if let Some(l1) = leg1.as_ref() {
-            let total_cost = l1.price * shares + price * shares;
-            let payout = shares; // $1 per share pair
+        // Calculate profit using stored leg1 info
+        let leg1_info = self.leg1_info.read().await;
+        if let Some(l1) = leg1_info.as_ref() {
+            let total_cost = l1.price * l1.shares + price * shares;
+            let payout = shares; // $1 per share pair (assuming equal shares)
             let profit = payout - total_cost;
-            let profit_pct = (profit / total_cost) * Decimal::ONE_HUNDRED;
+            let profit_pct = if total_cost > Decimal::ZERO {
+                (profit / total_cost) * Decimal::ONE_HUNDRED
+            } else {
+                Decimal::ZERO
+            };
 
+            let mode = if paper_trader.is_some() { "PAPER" } else { "LIVE" };
             self.log(&format!(
-                "CYCLE COMPLETE! Cost: ${:.4}, Payout: ${:.4}, Profit: ${:.4} ({:.2}%)",
-                total_cost, payout, profit, profit_pct
+                "[{}] CYCLE COMPLETE! Cost: ${:.4}, Payout: ${:.4}, Profit: ${:.4} ({:.2}%)",
+                mode, total_cost, payout, profit, profit_pct
             )).await;
 
             // Update totals
@@ -321,6 +350,9 @@ impl AutoTrader {
     async fn reset_cycle(&self) {
         let mut state = self.state.write().await;
         *state = StrategyState::Watching;
+
+        let mut leg1_info = self.leg1_info.write().await;
+        *leg1_info = None;
 
         let mut leg1 = self.leg1_result.write().await;
         *leg1 = None;

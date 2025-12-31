@@ -31,6 +31,8 @@ pub struct App {
     recorder: Recorder,
     paper_trader: PaperTrader,
     record_only: bool,
+    paper_mode: bool,  // true = paper trading, false = live trading
+    pending_mode_switch: Option<bool>,  // Pending mode switch awaiting confirmation
 
     // UI state
     input: String,
@@ -42,7 +44,6 @@ pub struct App {
     // Cached state for UI
     cached_balance: Decimal,
     cached_pnl: Decimal,
-    cached_auto_enabled: bool,
     cached_market_slug: Option<String>,
     cached_seconds_remaining: Option<i64>,
 }
@@ -76,12 +77,16 @@ impl App {
         messages.push("Type 'help' for available commands".to_string());
         messages.push("".to_string());
 
+        let paper_mode = config.paper_trading.enabled;
+
         Ok(Self {
             watcher: MarketWatcher::new(config.clone()),
             auto_trader: AutoTrader::new(auto_params),
             recorder,
             paper_trader,
             record_only,
+            paper_mode,
+            pending_mode_switch: None,
             input: String::new(),
             messages,
             should_quit: false,
@@ -89,7 +94,6 @@ impl App {
             last_down_price: None,
             cached_balance: starting_balance,
             cached_pnl: Decimal::ZERO,
-            cached_auto_enabled: false,
             cached_market_slug: None,
             cached_seconds_remaining: None,
             config,
@@ -202,9 +206,6 @@ impl App {
             self.cached_seconds_remaining = None;
         }
 
-        // Update cached auto_enabled for UI
-        self.cached_auto_enabled = self.auto_trader.is_enabled().await;
-
         // Update prices
         self.last_up_price = self.watcher.get_up_price().await;
         self.last_down_price = self.watcher.get_down_price().await;
@@ -226,7 +227,12 @@ impl App {
 
         // Run auto trader (if not in record-only mode)
         if !self.record_only {
-            if let Err(e) = self.auto_trader.tick(&self.watcher).await {
+            let paper_trader = if self.paper_mode {
+                Some(&self.paper_trader)
+            } else {
+                None
+            };
+            if let Err(e) = self.auto_trader.tick(&self.watcher, paper_trader).await {
                 self.log(&format!("Strategy error: {}", e));
             }
         }
@@ -250,8 +256,10 @@ impl App {
             "status" => self.show_status().await,
             "buy" => self.handle_buy(&parts).await,
             "buyshares" => self.handle_buyshares(&parts).await,
-            "auto" => self.handle_auto(&parts).await,
-            "params" => self.show_params().await,
+            "params" => self.handle_params(&parts).await,
+            "mode" => self.handle_mode(&parts).await,
+            "yes" | "y" => self.confirm_mode_switch().await,
+            "no" | "n" => self.cancel_mode_switch(),
             "logs" => self.show_logs().await,
             "balance" | "bal" => self.show_balance().await,
             "positions" | "pos" => self.show_positions().await,
@@ -271,18 +279,18 @@ impl App {
         self.log("  buy down <usd>   - Buy DOWN shares for USD amount");
         self.log("  buyshares up <n> - Buy N UP shares at best ask");
         self.log("  buyshares down <n> - Buy N DOWN shares at best ask");
-        self.log("  auto on <shares> [sum] [move] [window]");
-        self.log("                   - Enable auto trading");
-        self.log("  auto off         - Disable auto trading");
-        self.log("  params           - Show current parameters");
+        self.log("  params           - Show current strategy parameters");
+        self.log("  params <shares> [sum] [move] [window]");
+        self.log("                   - Update strategy parameters");
+        self.log("  mode             - Show current trading mode");
+        self.log("  mode paper       - Switch to paper trading");
+        self.log("  mode live        - Switch to live trading (requires confirmation)");
         self.log("  logs             - Show strategy logs");
-        if self.config.paper_trading.enabled {
-            self.log("  balance (bal)    - Show paper trading balance");
-            self.log("  positions (pos)  - Show current positions");
-            self.log("  pnl              - Show profit/loss summary");
-            self.log("  trades           - Show recent trades");
-            self.log("  reset            - Reset paper trading");
-        }
+        self.log("  balance (bal)    - Show trading balance");
+        self.log("  positions (pos)  - Show current positions");
+        self.log("  pnl              - Show profit/loss summary");
+        self.log("  trades           - Show recent trades");
+        self.log("  reset            - Reset paper trading balance/history");
         self.log("  clear            - Clear message log");
         self.log("  quit             - Exit the bot");
     }
@@ -309,10 +317,8 @@ impl App {
         }
 
         let state = self.auto_trader.get_state().await;
-        self.log(&format!("Auto: {} ({:?})",
-            if self.auto_trader.is_enabled().await { "ON" } else { "OFF" },
-            state
-        ));
+        let mode = if self.paper_mode { "PAPER" } else { "LIVE" };
+        self.log(&format!("Mode: {} | State: {:?}", mode, state));
     }
 
     async fn handle_buy(&mut self, parts: &[&str]) {
@@ -442,73 +448,115 @@ impl App {
         }
     }
 
-    async fn handle_auto(&mut self, parts: &[&str]) {
+    async fn handle_params(&mut self, parts: &[&str]) {
         if parts.len() < 2 {
-            self.log("Usage: auto on <shares> [sum=0.95] [move=0.15] [window=2]");
-            self.log("       auto off");
+            // Show current params
+            let params = self.auto_trader.get_params().await;
+            self.log("Current strategy parameters:");
+            self.log(&format!("  shares:    {}", params.shares));
+            self.log(&format!("  sum:       {}", params.sum_target));
+            self.log(&format!("  move:      {}%", params.move_pct * Decimal::ONE_HUNDRED));
+            self.log(&format!("  window:    {} min", params.window_min));
+            self.log("");
+            self.log("To update: params <shares> [sum] [move] [window]");
+            return;
+        }
+
+        // Update params
+        let shares: Decimal = match parts[1].parse() {
+            Ok(v) => v,
+            Err(_) => {
+                self.log("Invalid shares amount");
+                return;
+            }
+        };
+
+        let sum = parts.get(2)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(Decimal::new(95, 2));
+
+        let move_pct = parts.get(3)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(Decimal::new(15, 2));
+
+        let window = parts.get(4)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(2u32);
+
+        let new_params = AutoParams {
+            shares,
+            sum_target: sum,
+            move_pct,
+            window_min: window,
+        };
+        self.auto_trader.set_params(new_params).await;
+
+        self.log(&format!(
+            "Params updated: {} shares, sum={}, move={}%, window={}min",
+            shares, sum, move_pct * Decimal::ONE_HUNDRED, window
+        ));
+    }
+
+    async fn handle_mode(&mut self, parts: &[&str]) {
+        if parts.len() < 2 {
+            // Show current mode
+            let mode = if self.paper_mode { "PAPER" } else { "LIVE" };
+            self.log(&format!("Current mode: {}", mode));
+            self.log("");
+            self.log("To switch: mode paper | mode live");
             return;
         }
 
         match parts[1].to_lowercase().as_str() {
-            "on" => {
-                if parts.len() < 3 {
-                    self.log("Usage: auto on <shares> [sum] [move] [window]");
-                    return;
+            "paper" => {
+                if self.paper_mode {
+                    self.log("Already in PAPER trading mode");
+                } else {
+                    self.paper_mode = true;
+                    self.log("Switched to PAPER trading mode");
                 }
-
-                let shares: Decimal = match parts[2].parse() {
-                    Ok(v) => v,
-                    Err(_) => {
-                        self.log("Invalid shares amount");
+            }
+            "live" => {
+                if !self.paper_mode {
+                    self.log("Already in LIVE trading mode");
+                } else {
+                    // Require confirmation for live trading
+                    if !self.watcher.client().is_authenticated() {
+                        self.log("Cannot switch to LIVE mode - not authenticated");
+                        self.log("Configure private key in config or POLYMARKET_PRIVATE_KEY env var");
                         return;
                     }
-                };
-
-                let sum = parts.get(3)
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(Decimal::new(95, 2));
-
-                let move_pct = parts.get(4)
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(Decimal::new(15, 2));
-
-                let window = parts.get(5)
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(2u32);
-
-                // Update the params
-                let new_params = AutoParams {
-                    shares,
-                    sum_target: sum,
-                    move_pct,
-                    window_min: window,
-                };
-                self.auto_trader.set_params(new_params).await;
-
-                self.log(&format!(
-                    "Auto ON: {} shares, sum={}, move={}%, window={}min",
-                    shares, sum, move_pct * Decimal::ONE_HUNDRED, window
-                ));
-
-                self.auto_trader.enable().await;
-            }
-            "off" => {
-                self.auto_trader.disable().await;
-                self.log("Auto trading disabled");
+                    self.pending_mode_switch = Some(false); // false = switch to live
+                    self.log("WARNING: You are about to switch to LIVE trading mode!");
+                    self.log("Real orders will be placed with real money.");
+                    self.log("Type 'yes' or 'y' to confirm, 'no' or 'n' to cancel");
+                }
             }
             _ => {
-                self.log("Usage: auto on/off");
+                self.log("Usage: mode paper | mode live");
             }
         }
     }
 
-    async fn show_params(&mut self) {
-        let params = self.auto_trader.get_params().await;
-        self.log("Current parameters:");
-        self.log(&format!("  shares:    {}", params.shares));
-        self.log(&format!("  sum:       {}", params.sum_target));
-        self.log(&format!("  move:      {}%", params.move_pct * Decimal::ONE_HUNDRED));
-        self.log(&format!("  window:    {} min", params.window_min));
+    async fn confirm_mode_switch(&mut self) {
+        if let Some(to_live) = self.pending_mode_switch.take() {
+            if !to_live {
+                // Confirming switch to live
+                self.paper_mode = false;
+                self.log("CONFIRMED: Now in LIVE trading mode");
+                self.log("Real orders will be placed!");
+            }
+        } else {
+            self.log("Nothing to confirm");
+        }
+    }
+
+    fn cancel_mode_switch(&mut self) {
+        if self.pending_mode_switch.take().is_some() {
+            self.log("Mode switch cancelled");
+        } else {
+            self.log("Nothing to cancel");
+        }
     }
 
     async fn show_logs(&mut self) {
@@ -668,8 +716,8 @@ impl App {
         self.last_down_price
     }
 
-    pub fn auto_enabled(&self) -> bool {
-        self.cached_auto_enabled
+    pub fn is_paper_mode(&self) -> bool {
+        self.paper_mode
     }
 
     pub fn market_slug(&self) -> Option<String> {
