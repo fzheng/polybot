@@ -1,0 +1,50 @@
+# PolyBot Configuration
+# Polymarket Trading Bot for BTC 15-minute UP/DOWN markets
+
+[api]
+# CLOB API endpoint
+clob_endpoint = "https://clob.polymarket.com"
+
+# WebSocket endpoint for real-time prices
+ws_endpoint = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+
+# Gamma API endpoint (for market metadata)
+gamma_endpoint = "https://gamma-api.polymarket.com"
+
+# Private key (recommended: use PK or POLYMARKET_PRIVATE_KEY env var instead)
+# private_key = ""
+
+# Funder address (for proxy/Safe wallets)
+# funder_address = ""
+
+# Signature type: 0 = EOA/MetaMask, 1 = Magic/Email, 2 = Proxy/Safe
+signature_type = 0
+
+[trading]
+# Default number of shares per trade
+default_shares = 10
+
+# Default sum target for hedge condition (leg1_price + opposite_ask <= sum_target)
+default_sum_target = 0.95
+
+# Default dump threshold percentage (0.15 = 15%)
+default_move_pct = 0.15
+
+# Default window in minutes for Leg 1 (only buy during first N minutes)
+default_window_min = 2
+
+# Dump detection window in seconds
+dump_window_secs = 3
+
+# Market pattern to search for
+market_pattern = "bitcoin-15-minute"
+
+[recording]
+# Enable price recording for backtesting
+enabled = true
+
+# Directory to store recorded data
+data_dir = "data"
+
+# Recording interval in milliseconds
+interval_ms = 1000

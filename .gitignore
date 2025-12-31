@@ -1,0 +1,33 @@
+# Sandbox (PDFs, test files)
+sandbox/
+
+# Rust build artifacts
+/target/
+Cargo.lock
+
+# Environment files (contains secrets!)
+.env
+.env.local
+.env.*.local
+
+# Recorded data (can be large)
+/data/
+*.jsonl
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Claude Code
+.claude/
+.claude_memory
+CLAUDE.md

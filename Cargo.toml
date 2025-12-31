@@ -1,0 +1,65 @@
+[package]
+name = "polybot"
+version = "0.1.0"
+edition = "2021"
+description = "Automated Polymarket trading bot for BTC 15-minute UP/DOWN markets"
+authors = ["Your Name"]
+license = "MIT"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.42", features = ["full"] }
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+
+# WebSocket
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+
+# Serialization
+serde = { version = "1.0.217", features = ["derive"] }
+serde_json = "1.0"
+
+# Crypto/signing (using latest stable alloy)
+alloy = { version = "1.2", features = ["signers", "signer-local"] }
+hex = "0.4"
+
+# Decimal math for precise financial calculations
+rust_decimal = { version = "1.36", features = ["serde"] }
+rust_decimal_macros = "1.36"
+
+# Terminal UI
+ratatui = "0.29"
+crossterm = "0.28"
+
+# CLI parsing
+clap = { version = "4.5", features = ["derive"] }
+
+# Environment and config
+dotenvy = "0.15"
+toml = "0.8"
+
+# URL encoding
+urlencoding = "2.1"
+
+# Futures
+futures = "0.3"
+
+# Time handling
+chrono = { version = "0.4", features = ["serde"] }
+
+# Error handling
+anyhow = "1.0"
+thiserror = "2.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# UUID for order IDs
+uuid = { version = "1.11", features = ["v4"] }
+
+[[bin]]
+name = "polybot"
+path = "src/main.rs"
