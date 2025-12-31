@@ -129,7 +129,7 @@ impl AutoTrader {
             StrategyState::WaitingForHedge { leg1_side, leg1_price } => {
                 self.watch_for_hedge(watcher, paper_trader, leg1_side, leg1_price).await?;
             }
-            StrategyState::Completed | StrategyState::Abandoned => {
+            StrategyState::Completed => {
                 // Reset for next cycle
                 self.reset_cycle().await;
             }

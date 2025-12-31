@@ -1,4 +1,10 @@
 //! Paper trading module - simulates trades without real orders
+//!
+//! This module provides a complete paper trading simulation that:
+//! - Tracks positions by round (market slug)
+//! - Settles positions when rounds end
+//! - Maintains history of settled rounds with P&L
+//! - Provides accurate balance and P&L accounting
 
 #![allow(dead_code)]
 
@@ -24,6 +30,8 @@ pub struct Position {
     pub avg_entry_price: Decimal,
     pub current_value: Decimal,
     pub unrealized_pnl: Decimal,
+    /// The round this position belongs to
+    pub round_slug: String,
 }
 
 /// A paper trade record
@@ -60,6 +68,36 @@ pub struct PaperTradingStats {
     pub cycles_abandoned: u32,
 }
 
+/// Record of a settled round
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SettledRound {
+    pub round_slug: String,
+    pub settled_at: DateTime<Utc>,
+    pub winning_side: Side,
+    /// UP position: (shares, avg_price, pnl)
+    pub up_position: Option<(Decimal, Decimal, Decimal)>,
+    /// DOWN position: (shares, avg_price, pnl)
+    pub down_position: Option<(Decimal, Decimal, Decimal)>,
+    /// Total cost paid for positions
+    pub total_cost: Decimal,
+    /// Total payout received
+    pub total_payout: Decimal,
+    /// Net P&L for this round
+    pub net_pnl: Decimal,
+}
+
+/// Live position summary for a round
+#[derive(Debug, Clone, Default)]
+pub struct LivePositionSummary {
+    pub round_slug: String,
+    pub up_shares: Decimal,
+    pub up_avg_price: Decimal,
+    pub down_shares: Decimal,
+    pub down_avg_price: Decimal,
+    /// Average total cost per share pair (should be < $1 for profit)
+    pub avg_cost_per_pair: Option<Decimal>,
+}
+
 /// Paper trading engine
 pub struct PaperTrader {
     config: PaperTradingConfig,
@@ -68,6 +106,8 @@ pub struct PaperTrader {
     positions: Arc<RwLock<HashMap<String, Position>>>,
     trades: Arc<RwLock<Vec<PaperTrade>>>,
     stats: Arc<RwLock<PaperTradingStats>>,
+    /// History of settled rounds
+    settled_rounds: Arc<RwLock<Vec<SettledRound>>>,
     log_writer: Option<Arc<RwLock<BufWriter<File>>>>,
 }
 
@@ -95,6 +135,7 @@ impl PaperTrader {
             positions: Arc::new(RwLock::new(HashMap::new())),
             trades: Arc::new(RwLock::new(Vec::new())),
             stats: Arc::new(RwLock::new(PaperTradingStats::default())),
+            settled_rounds: Arc::new(RwLock::new(Vec::new())),
             log_writer,
         })
     }
@@ -135,16 +176,31 @@ impl PaperTrader {
         trades.iter().rev().take(count).cloned().collect()
     }
 
-    /// Get total PnL (realized + unrealized)
+    /// Get realized PnL (from settled rounds only)
+    /// Does NOT include money tied up in open/unsettled positions.
+    /// Formula: (balance + open_position_costs) - starting_balance
+    /// This "adds back" the money spent on open positions to show only realized gains/losses.
     pub async fn get_total_pnl(&self) -> Decimal {
         let balance = self.get_balance().await;
         let positions = self.positions.read().await;
 
-        let positions_value: Decimal = positions.values()
-            .map(|p| p.current_value)
+        // Calculate cost of open positions (money tied up in unsettled orders)
+        let open_position_costs: Decimal = positions.values()
+            .map(|p| p.shares * p.avg_entry_price)
             .sum();
+        drop(positions);
 
-        (balance + positions_value) - self.starting_balance
+        // Realized P&L = (balance + open costs) - starting
+        // This excludes unrealized gains/losses from open positions
+        (balance + open_position_costs) - self.starting_balance
+    }
+
+    /// Get total value of outstanding positions (cost basis)
+    pub async fn get_positions_cost(&self) -> Decimal {
+        let positions = self.positions.read().await;
+        positions.values()
+            .map(|p| p.shares * p.avg_entry_price)
+            .sum()
     }
 
     /// Simulate buying shares
@@ -189,6 +245,7 @@ impl PaperTrader {
             avg_entry_price: Decimal::ZERO,
             current_value: Decimal::ZERO,
             unrealized_pnl: Decimal::ZERO,
+            round_slug: round_slug.to_string(),
         });
 
         // Calculate new average entry price
@@ -362,28 +419,39 @@ impl PaperTrader {
         round_slug: &str,
     ) -> Result<Decimal> {
         let mut total_pnl = Decimal::ZERO;
+        let mut total_cost = Decimal::ZERO;
+        let mut total_payout = Decimal::ZERO;
+        let mut up_position_info: Option<(Decimal, Decimal, Decimal)> = None;
+        let mut down_position_info: Option<(Decimal, Decimal, Decimal)> = None;
+
         let mut positions = self.positions.write().await;
 
-        // Process winning position
-        let winning_token = match winning_side {
-            Side::Up => up_token_id,
-            Side::Down => down_token_id,
-        };
-
-        if let Some(pos) = positions.remove(winning_token) {
-            // Winning position pays out $1 per share
-            let payout = pos.shares;
+        // Process UP position
+        if let Some(pos) = positions.remove(up_token_id) {
             let cost_basis = pos.shares * pos.avg_entry_price;
-            let pnl = payout - cost_basis;
+            total_cost += cost_basis;
+
+            let (payout, pnl) = if winning_side == Side::Up {
+                // UP won - pays $1 per share
+                let payout = pos.shares;
+                let pnl = payout - cost_basis;
+                total_payout += payout;
+                (payout, pnl)
+            } else {
+                // UP lost - worth $0
+                (Decimal::ZERO, -cost_basis)
+            };
+
             total_pnl += pnl;
+            up_position_info = Some((pos.shares, pos.avg_entry_price, pnl));
 
             let mut balance = self.balance.write().await;
             *balance += payout;
             drop(balance);
 
             tracing::info!(
-                "[PAPER] Round settled - {} WON: {} shares at ${:.4} avg, payout ${:.2}, PnL ${:.2}",
-                winning_side,
+                "[PAPER] Round settled - UP {}: {} shares at ${:.4} avg, payout ${:.2}, PnL ${:.2}",
+                if winning_side == Side::Up { "WON" } else { "LOST" },
                 pos.shares,
                 pos.avg_entry_price,
                 payout,
@@ -391,38 +459,76 @@ impl PaperTrader {
             );
         }
 
-        // Process losing position
-        let losing_token = match winning_side {
-            Side::Up => down_token_id,
-            Side::Down => up_token_id,
-        };
-
-        if let Some(pos) = positions.remove(losing_token) {
-            // Losing position is worth $0
+        // Process DOWN position
+        if let Some(pos) = positions.remove(down_token_id) {
             let cost_basis = pos.shares * pos.avg_entry_price;
-            let pnl = -cost_basis;
+            total_cost += cost_basis;
+
+            let (payout, pnl) = if winning_side == Side::Down {
+                // DOWN won - pays $1 per share
+                let payout = pos.shares;
+                let pnl = payout - cost_basis;
+                total_payout += payout;
+                (payout, pnl)
+            } else {
+                // DOWN lost - worth $0
+                (Decimal::ZERO, -cost_basis)
+            };
+
             total_pnl += pnl;
+            down_position_info = Some((pos.shares, pos.avg_entry_price, pnl));
+
+            let mut balance = self.balance.write().await;
+            *balance += payout;
+            drop(balance);
 
             tracing::info!(
-                "[PAPER] Round settled - {} LOST: {} shares at ${:.4} avg, lost ${:.2}",
-                pos.side,
+                "[PAPER] Round settled - DOWN {}: {} shares at ${:.4} avg, payout ${:.2}, PnL ${:.2}",
+                if winning_side == Side::Down { "WON" } else { "LOST" },
                 pos.shares,
                 pos.avg_entry_price,
-                cost_basis
+                payout,
+                pnl
             );
         }
 
         drop(positions);
 
+        // Only create a settled round record if we had positions
+        if up_position_info.is_some() || down_position_info.is_some() {
+            let settled = SettledRound {
+                round_slug: round_slug.to_string(),
+                settled_at: Utc::now(),
+                winning_side,
+                up_position: up_position_info,
+                down_position: down_position_info,
+                total_cost,
+                total_payout,
+                net_pnl: total_pnl,
+            };
+
+            let mut settled_rounds = self.settled_rounds.write().await;
+            settled_rounds.push(settled);
+            drop(settled_rounds);
+        }
+
         // Update stats
         let mut stats = self.stats.write().await;
         stats.realized_pnl += total_pnl;
-        stats.cycles_completed += 1;
+        if up_position_info.is_some() || down_position_info.is_some() {
+            stats.cycles_completed += 1;
+        }
 
         if total_pnl > Decimal::ZERO {
             stats.winning_trades += 1;
+            if total_pnl > stats.best_trade {
+                stats.best_trade = total_pnl;
+            }
         } else if total_pnl < Decimal::ZERO {
             stats.losing_trades += 1;
+            if total_pnl < stats.worst_trade {
+                stats.worst_trade = total_pnl;
+            }
         }
         drop(stats);
 
@@ -432,6 +538,8 @@ impl PaperTrader {
             "timestamp": Utc::now().to_rfc3339(),
             "round_slug": round_slug,
             "winning_side": winning_side.as_str(),
+            "total_cost": total_cost.to_string(),
+            "total_payout": total_payout.to_string(),
             "pnl": total_pnl.to_string(),
             "balance_after": self.get_balance().await.to_string(),
         });
@@ -443,6 +551,62 @@ impl PaperTrader {
         }
 
         Ok(total_pnl)
+    }
+
+    /// Get settled rounds history
+    pub async fn get_settled_rounds(&self) -> Vec<SettledRound> {
+        self.settled_rounds.read().await.clone()
+    }
+
+    /// Get positions for a specific round
+    pub async fn get_positions_for_round(&self, round_slug: &str) -> Vec<Position> {
+        let positions = self.positions.read().await;
+        positions.values()
+            .filter(|p| p.round_slug == round_slug)
+            .cloned()
+            .collect()
+    }
+
+    /// Get live position summary for current round
+    pub async fn get_live_position_summary(&self, round_slug: &str) -> LivePositionSummary {
+        let positions = self.positions.read().await;
+        let mut summary = LivePositionSummary {
+            round_slug: round_slug.to_string(),
+            ..Default::default()
+        };
+
+        for pos in positions.values() {
+            if pos.round_slug == round_slug {
+                match pos.side {
+                    Side::Up => {
+                        summary.up_shares = pos.shares;
+                        summary.up_avg_price = pos.avg_entry_price;
+                    }
+                    Side::Down => {
+                        summary.down_shares = pos.shares;
+                        summary.down_avg_price = pos.avg_entry_price;
+                    }
+                }
+            }
+        }
+
+        // Calculate average cost per share pair if we have both sides
+        if summary.up_shares > Decimal::ZERO && summary.down_shares > Decimal::ZERO {
+            let min_shares = summary.up_shares.min(summary.down_shares);
+            if min_shares > Decimal::ZERO {
+                let paired_cost = (summary.up_avg_price * min_shares)
+                    + (summary.down_avg_price * min_shares);
+                summary.avg_cost_per_pair = Some(paired_cost / min_shares);
+            }
+        }
+
+        summary
+    }
+
+    /// Check if there are any open positions for a round
+    pub async fn has_positions_for_round(&self, round_slug: &str) -> bool {
+        let positions = self.positions.read().await;
+        positions.values().any(|p| p.round_slug == round_slug)
     }
 
     /// Mark a cycle as abandoned (round changed before completion)
@@ -520,6 +684,10 @@ impl PaperTrader {
         let mut stats = self.stats.write().await;
         *stats = PaperTradingStats::default();
         drop(stats);
+
+        let mut settled = self.settled_rounds.write().await;
+        settled.clear();
+        drop(settled);
 
         tracing::info!("[PAPER] Paper trading reset. Balance: ${}", self.starting_balance);
     }

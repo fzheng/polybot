@@ -66,6 +66,9 @@ struct MarketData {
     /// Outcomes as JSON array string e.g. "[\"Yes\", \"No\"]"
     #[serde(default)]
     outcomes: Option<String>,
+    /// Outcome prices as JSON array string e.g. "[\"0\", \"1\"]" - winner has price "1"
+    #[serde(rename = "outcomePrices", default)]
+    outcome_prices: Option<String>,
     #[serde(rename = "endDateIso")]
     end_date_iso: Option<String>,
     #[serde(rename = "endDate")]
@@ -132,6 +135,27 @@ struct OrderResponse {
     price: String,
     #[serde(default)]
     error_msg: Option<String>,
+}
+
+/// Token position from the API
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct TokenPosition {
+    /// The token ID
+    #[serde(rename = "asset_id", default)]
+    pub token_id: String,
+    /// Number of shares held
+    #[serde(default)]
+    pub size: Decimal,
+    /// Average entry price
+    #[serde(rename = "avg_price", default)]
+    pub avg_price: Decimal,
+    /// Current market price
+    #[serde(rename = "market_price", default)]
+    pub market_price: Option<Decimal>,
+    /// Unrealized P&L
+    #[serde(rename = "unrealized_pnl", default)]
+    pub unrealized_pnl: Option<Decimal>,
 }
 
 impl PolymarketClient {
@@ -505,5 +529,115 @@ impl PolymarketClient {
     /// Check if client is authenticated
     pub fn is_authenticated(&self) -> bool {
         self.api_key.is_some()
+    }
+
+    /// Get account balance (USDC.e)
+    /// Returns the available USDC.e balance for trading
+    pub async fn get_balance(&self) -> Result<Decimal> {
+        if self.api_key.is_none() {
+            anyhow::bail!("Not authenticated - cannot get balance");
+        }
+
+        let url = format!("{}/balance", self.clob_endpoint);
+
+        let resp = self.client
+            .get(&url)
+            .header("POLY-API-KEY", self.api_key.as_deref().unwrap_or(""))
+            .header("POLY-SECRET", self.api_secret.as_deref().unwrap_or(""))
+            .header("POLY-PASSPHRASE", self.api_passphrase.as_deref().unwrap_or(""))
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to get balance: {}", body);
+        }
+
+        // Response is like: { "balance": "1234.56" }
+        let balance_resp: serde_json::Value = resp.json().await?;
+        let balance_str = balance_resp["balance"]
+            .as_str()
+            .unwrap_or("0");
+
+        balance_str.parse::<Decimal>()
+            .context("Failed to parse balance")
+    }
+
+    /// Get all open positions
+    /// Returns a list of token positions with sizes
+    pub async fn get_positions(&self) -> Result<Vec<TokenPosition>> {
+        if self.api_key.is_none() {
+            anyhow::bail!("Not authenticated - cannot get positions");
+        }
+
+        let url = format!("{}/positions", self.clob_endpoint);
+
+        let resp = self.client
+            .get(&url)
+            .header("POLY-API-KEY", self.api_key.as_deref().unwrap_or(""))
+            .header("POLY-SECRET", self.api_secret.as_deref().unwrap_or(""))
+            .header("POLY-PASSPHRASE", self.api_passphrase.as_deref().unwrap_or(""))
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to get positions: {}", body);
+        }
+
+        let positions: Vec<TokenPosition> = resp.json().await?;
+        Ok(positions)
+    }
+
+    /// Get market outcome (resolution) for a closed market
+    /// Returns Some(Side) if the market is resolved, None if still open
+    pub async fn get_market_outcome(&self, slug: &str) -> Result<Option<crate::types::Side>> {
+        let url = format!("{}/events?slug={}", self.gamma_endpoint, slug);
+
+        let resp = self.client.get(&url).send().await?;
+
+        if !resp.status().is_success() {
+            return Ok(None);
+        }
+
+        let events: Vec<EventData> = resp.json().await?;
+
+        if let Some(event) = events.into_iter().next() {
+            if let Some(market) = event.markets.into_iter().next() {
+                // Check if market is closed
+                if !market.closed {
+                    return Ok(None);
+                }
+
+                // Parse outcomes and outcomePrices
+                let outcomes: Vec<String> = market.outcomes.as_ref()
+                    .and_then(|s| serde_json::from_str(s).ok())
+                    .unwrap_or_default();
+
+                // outcomePrices is like "[\"0\", \"1\"]" - the winning outcome has price "1"
+                let outcome_prices: Vec<String> = market.outcome_prices.as_ref()
+                    .and_then(|s| serde_json::from_str(s).ok())
+                    .unwrap_or_default();
+
+                if outcomes.len() != outcome_prices.len() || outcomes.is_empty() {
+                    return Ok(None);
+                }
+
+                // Find which outcome has price "1" (the winner)
+                for (i, price) in outcome_prices.iter().enumerate() {
+                    if price == "1" {
+                        let outcome = &outcomes[i];
+                        let outcome_lower = outcome.to_lowercase();
+                        if outcome_lower.contains("up") || outcome_lower == "yes" {
+                            return Ok(Some(crate::types::Side::Up));
+                        } else if outcome_lower.contains("down") || outcome_lower == "no" {
+                            return Ok(Some(crate::types::Side::Down));
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(None)
     }
 }

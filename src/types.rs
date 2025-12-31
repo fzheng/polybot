@@ -206,56 +206,6 @@ pub struct OrderBook {
     pub ask_size: Option<Decimal>,
 }
 
-impl OrderBook {
-    /// Calculates the bid-ask spread.
-    ///
-    /// Returns `None` if either bid or ask is unavailable.
-    /// A smaller spread indicates more liquid market.
-    #[inline]
-    pub fn spread(&self) -> Option<Decimal> {
-        match (self.best_bid, self.best_ask) {
-            (Some(bid), Some(ask)) => Some(ask - bid),
-            _ => None,
-        }
-    }
-
-    /// Calculates the mid-price (average of bid and ask).
-    ///
-    /// Returns `None` if either bid or ask is unavailable.
-    #[inline]
-    pub fn mid_price(&self) -> Option<Decimal> {
-        match (self.best_bid, self.best_ask) {
-            (Some(bid), Some(ask)) => Some((bid + ask) / Decimal::TWO),
-            _ => None,
-        }
-    }
-}
-
-// ============================================================================
-// Orders and Trades
-// ============================================================================
-
-/// An order placed on the exchange.
-///
-/// Represents a limit order in the order book.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Order {
-    /// Unique order identifier from the exchange
-    pub id: String,
-    /// Token being traded
-    pub token_id: String,
-    /// Whether this is a buy or sell order
-    pub side: BuySell,
-    /// Limit price for the order
-    pub price: Decimal,
-    /// Number of shares
-    pub size: Decimal,
-    /// Order type (GTC, FOK, IOC)
-    pub order_type: OrderType,
-    /// When the order was created
-    pub created_at: DateTime<Utc>,
-}
-
 /// Result of a trade execution.
 ///
 /// Contains details about how an order was filled.
@@ -304,17 +254,16 @@ pub enum TradeStatus {
 ///
 /// ```text
 /// Watching -> WaitingForHedge -> Completed
-///     |             |
-///     v             v
-///   (wait)      Abandoned (on round change)
+///     |
+///     v
+///   (wait for next round)
 /// ```
 ///
 /// # State Transitions
 ///
 /// - `Watching` -> `WaitingForHedge`: When a price dump is detected and Leg 1 executed
 /// - `WaitingForHedge` -> `Completed`: When hedge condition met and Leg 2 executed
-/// - Any state -> `Abandoned`: When the round changes before completion
-/// - `Completed`/`Abandoned` -> `Watching`: Automatic reset for next cycle
+/// - `Completed` -> `Watching`: Automatic reset for next cycle
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StrategyState {
     /// Watching for a price dump during the allowed window.
@@ -330,8 +279,6 @@ pub enum StrategyState {
     },
     /// Both legs completed successfully. Cycle finished.
     Completed,
-    /// Cycle abandoned before completion (e.g., round changed).
-    Abandoned,
 }
 
 impl Default for StrategyState {

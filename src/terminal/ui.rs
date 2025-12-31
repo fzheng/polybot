@@ -13,21 +13,21 @@ use super::app::App;
 
 /// Draw the main UI
 pub fn draw(f: &mut Frame, app: &App) {
-    // Header height: 4 base lines + 2 if paper trading (balance/pnl)
-    let header_height = if app.is_paper_trading() { 9 } else { 7 };
-
-    let chunks = Layout::default()
+    // Main layout: header row, middle row (positions + history), log, input
+    let main_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(header_height),  // Header/prices
-            Constraint::Min(10),    // Messages
-            Constraint::Length(3),  // Input
+            Constraint::Length(7),   // Header row (prices + status)
+            Constraint::Length(6),   // Middle row (positions + history)
+            Constraint::Min(8),      // Log
+            Constraint::Length(3),   // Input
         ])
         .split(f.area());
 
-    draw_header(f, app, chunks[0]);
-    draw_messages(f, app, chunks[1]);
-    draw_input(f, app, chunks[2]);
+    draw_header(f, app, main_chunks[0]);
+    draw_middle_row(f, app, main_chunks[1]);
+    draw_messages(f, app, main_chunks[2]);
+    draw_input(f, app, main_chunks[3]);
 }
 
 fn draw_header(f: &mut Frame, app: &App, area: Rect) {
@@ -46,9 +46,24 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     draw_status(f, app, chunks[1]);
 }
 
+fn draw_middle_row(f: &mut Frame, app: &App, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(40),
+            Constraint::Percentage(60),
+        ])
+        .split(area);
+
+    draw_live_position(f, app, chunks[0]);
+    draw_history(f, app, chunks[1]);
+}
+
 fn draw_prices(f: &mut Frame, app: &App, area: Rect) {
     let up_price = app.up_price().unwrap_or(Decimal::ZERO);
     let down_price = app.down_price().unwrap_or(Decimal::ZERO);
+    let up_size = app.up_ask_size();
+    let down_size = app.down_ask_size();
     let sum = up_price + down_price;
 
     let up_color = if up_price > Decimal::ZERO { Color::Green } else { Color::DarkGray };
@@ -59,6 +74,10 @@ fn draw_prices(f: &mut Frame, app: &App, area: Rect) {
         Color::DarkGray
     };
 
+    // Format sizes if available
+    let up_size_str = up_size.map(|s| format!(" x{:.0}", s)).unwrap_or_default();
+    let down_size_str = down_size.map(|s| format!(" x{:.0}", s)).unwrap_or_default();
+
     let text = vec![
         Line::from(vec![
             Span::styled("UP:   ", Style::default().fg(Color::White)),
@@ -66,12 +85,20 @@ fn draw_prices(f: &mut Frame, app: &App, area: Rect) {
                 format!("${:.4}", up_price),
                 Style::default().fg(up_color).add_modifier(Modifier::BOLD),
             ),
+            Span::styled(
+                up_size_str,
+                Style::default().fg(Color::DarkGray),
+            ),
         ]),
         Line::from(vec![
             Span::styled("DOWN: ", Style::default().fg(Color::White)),
             Span::styled(
                 format!("${:.4}", down_price),
                 Style::default().fg(down_color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                down_size_str,
+                Style::default().fg(Color::DarkGray),
             ),
         ]),
         Line::from(""),
@@ -125,21 +152,19 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
         ]),
     ];
 
-    // Show paper trading balance or recording status
-    if app.is_paper_trading() {
-        let pnl = app.paper_pnl();
+    // Show balance and P&L (paper or live) or recording status
+    if app.is_paper_trading() || app.is_live_trading() {
+        let pnl = app.trading_pnl();
         let pnl_color = if pnl >= Decimal::ZERO { Color::Green } else { Color::Red };
-        let pnl_sign = if pnl >= Decimal::ZERO { "+" } else { "" };
+        let pnl_sign = if pnl >= Decimal::ZERO { "+" } else { "-" };
 
         text.push(Line::from(vec![
-            Span::raw("Bal:    "),
+            Span::styled("Bal: ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                format!("${:.2}", app.paper_balance()),
+                format!("${:.2}", app.trading_balance()),
                 Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
             ),
-        ]));
-        text.push(Line::from(vec![
-            Span::raw("P&L:    "),
+            Span::styled("  P&L: ", Style::default().fg(Color::DarkGray)),
             Span::styled(
                 format!("{}${:.2}", pnl_sign, pnl.abs()),
                 Style::default().fg(pnl_color).add_modifier(Modifier::BOLD),
@@ -163,6 +188,118 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
 
     let paragraph = Paragraph::new(text).block(block);
     f.render_widget(paragraph, area);
+}
+
+fn draw_live_position(f: &mut Frame, app: &App, area: Rect) {
+    let pos = app.live_position();
+    let mut text = Vec::new();
+
+    let has_position = pos.up_shares > Decimal::ZERO || pos.down_shares > Decimal::ZERO;
+
+    if has_position {
+        if pos.up_shares > Decimal::ZERO {
+            text.push(Line::from(vec![
+                Span::styled("UP:   ", Style::default().fg(Color::Green)),
+                Span::styled(
+                    format!("{:.0}", pos.up_shares),
+                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(" @ ${:.4}", pos.up_avg_price),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
+        }
+        if pos.down_shares > Decimal::ZERO {
+            text.push(Line::from(vec![
+                Span::styled("DOWN: ", Style::default().fg(Color::Red)),
+                Span::styled(
+                    format!("{:.0}", pos.down_shares),
+                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(" @ ${:.4}", pos.down_avg_price),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
+        }
+
+        // Show arbitrage status if we have both sides
+        if let Some(avg_cost) = pos.avg_cost_per_pair {
+            let profit_margin = Decimal::ONE - avg_cost;
+            let status_color = if avg_cost < Decimal::ONE { Color::Green } else { Color::Red };
+            let status_text = if avg_cost < Decimal::ONE {
+                format!("Avg: ${:.4} (+{:.1}%)", avg_cost, profit_margin * Decimal::ONE_HUNDRED)
+            } else {
+                format!("Avg: ${:.4} (LOSS)", avg_cost)
+            };
+            text.push(Line::from(Span::styled(status_text, Style::default().fg(status_color))));
+        }
+    } else {
+        text.push(Line::from(Span::styled("No position", Style::default().fg(Color::DarkGray))));
+    }
+
+    let block = Block::default()
+        .title(" Position ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Magenta));
+
+    let paragraph = Paragraph::new(text).block(block);
+    f.render_widget(paragraph, area);
+}
+
+fn draw_history(f: &mut Frame, app: &App, area: Rect) {
+    let history = app.settled_history();
+    let height = area.height.saturating_sub(2) as usize;
+
+    let items: Vec<ListItem> = if history.is_empty() {
+        vec![ListItem::new(Line::from(Span::styled(
+            "No settled rounds",
+            Style::default().fg(Color::DarkGray),
+        )))]
+    } else {
+        history
+            .iter()
+            .rev()
+            .take(height)
+            .map(|round| {
+                let pnl_color = if round.net_pnl >= Decimal::ZERO { Color::Green } else { Color::Red };
+                let pnl_sign = if round.net_pnl >= Decimal::ZERO { "+" } else { "" };
+
+                // Extract just the timestamp part from slug for brevity
+                let short_slug = round.round_slug.split('-').last().unwrap_or(&round.round_slug);
+
+                // Format: "timestamp | bet $X | SIDE won | P&L"
+                Line::from(vec![
+                    Span::styled(
+                        format!("{} ", short_slug),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    Span::styled(
+                        format!("${:.0} ", round.total_cost),
+                        Style::default().fg(Color::White),
+                    ),
+                    Span::styled(
+                        format!("{} ", round.winning_side),
+                        Style::default().fg(if round.winning_side == crate::types::Side::Up { Color::Green } else { Color::Red }),
+                    ),
+                    Span::styled(
+                        format!("{}${:.2}", pnl_sign, round.net_pnl.abs()),
+                        Style::default().fg(pnl_color).add_modifier(Modifier::BOLD),
+                    ),
+                ])
+            })
+            .map(ListItem::new)
+            .collect()
+    };
+
+    let block = Block::default()
+        .title(" History ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Blue));
+
+    let list = List::new(items).block(block);
+    f.render_widget(list, area);
 }
 
 fn draw_messages(f: &mut Frame, app: &App, area: Rect) {

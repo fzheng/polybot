@@ -412,26 +412,36 @@ impl PriceStream {
         ask_size: Option<Decimal>,
     ) {
         // Update order book
-        {
+        let (final_bid_size, final_ask_size) = {
             let mut books = order_books.write().await;
             let book = books.entry(asset_id.to_string()).or_default();
+
+            // Update bid price and size (only update size if provided)
             if best_bid.is_some() {
                 book.best_bid = best_bid;
-                book.bid_size = bid_size;
+                if bid_size.is_some() {
+                    book.bid_size = bid_size;
+                }
             }
+
+            // Update ask price and size (only update size if provided)
             if best_ask.is_some() {
                 book.best_ask = best_ask;
-                book.ask_size = ask_size;
+                if ask_size.is_some() {
+                    book.ask_size = ask_size;
+                }
             }
-        }
 
-        // Send update notification
+            (book.bid_size, book.ask_size)
+        };
+
+        // Send update notification with current sizes
         let update = PriceUpdate {
             token_id: asset_id.to_string(),
             best_bid,
             best_ask,
-            bid_size,
-            ask_size,
+            bid_size: final_bid_size,
+            ask_size: final_ask_size,
             timestamp: Utc::now(),
         };
         let _ = update_tx.send(update);

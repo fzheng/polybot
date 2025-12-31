@@ -386,31 +386,4 @@ impl Config {
         }
     }
 
-    /// Get the private key, returning an error if not configured.
-    ///
-    /// # Returns
-    ///
-    /// The private key string, or an error with setup instructions.
-    pub fn get_private_key(&self) -> Result<&str> {
-        self.api
-            .private_key
-            .as_deref()
-            .context("Private key not configured. Set PK or POLYMARKET_PRIVATE_KEY env var")
-    }
-
-    /// Save default configuration to a file.
-    ///
-    /// Useful for generating a template configuration file.
-    ///
-    /// # Arguments
-    ///
-    /// * `path` - Path where to save the config file
-    pub fn save_default(path: &str) -> Result<()> {
-        let config = Config::default();
-        let content = toml::to_string_pretty(&config)
-            .context("Failed to serialize config")?;
-        std::fs::write(path, content)
-            .context("Failed to write config file")?;
-        Ok(())
-    }
 }

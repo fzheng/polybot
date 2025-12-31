@@ -10,22 +10,36 @@ use ratatui::{
     backend::CrosstermBackend,
     Terminal,
 };
+use chrono::Local;
 use rust_decimal::Decimal;
 use std::io;
 use std::time::Duration;
 
+use crate::api::PolymarketClient;
 use crate::config::Config;
 use crate::market::MarketWatcher;
-use crate::paper::PaperTrader;
+use crate::paper::{PaperTrader, LivePositionSummary, SettledRound};
 use crate::recorder::Recorder;
 use crate::strategy::AutoTrader;
 use crate::types::{AutoParams, Side};
 
 use super::ui;
 
+/// Previous market info for settlement
+#[derive(Clone)]
+struct PreviousMarket {
+    slug: String,
+    up_token_id: String,
+    down_token_id: String,
+    /// Final prices before round ended (captured before round change)
+    final_up_price: Option<Decimal>,
+    final_down_price: Option<Decimal>,
+}
+
 /// Application state
 pub struct App {
     config: Config,
+    client: PolymarketClient,
     watcher: MarketWatcher,
     auto_trader: AutoTrader,
     recorder: Recorder,
@@ -41,11 +55,30 @@ pub struct App {
     last_up_price: Option<Decimal>,
     last_down_price: Option<Decimal>,
 
-    // Cached state for UI
+    // Track previous market for settlement
+    previous_market: Option<PreviousMarket>,
+    // Pending settlements that were deferred (market not yet resolved)
+    pending_settlements: Vec<PreviousMarket>,
+    // Last time we tried to retry pending settlements
+    last_settlement_retry: Option<std::time::Instant>,
+
+    // Order book info for UI
+    cached_up_ask_size: Option<Decimal>,
+    cached_down_ask_size: Option<Decimal>,
+
+    // Cached state for UI (paper trading)
     cached_balance: Decimal,
     cached_pnl: Decimal,
     cached_market_slug: Option<String>,
     cached_seconds_remaining: Option<i64>,
+
+    // Cached positions and history for UI (paper trading)
+    cached_live_position: LivePositionSummary,
+    cached_history: Vec<SettledRound>,
+
+    // Cached state for live trading (fetched from Polymarket API)
+    cached_live_balance: Option<Decimal>,
+    last_live_balance_fetch: Option<std::time::Instant>,
 }
 
 impl App {
@@ -78,8 +111,10 @@ impl App {
         messages.push("".to_string());
 
         let paper_mode = config.paper_trading.enabled;
+        let client = PolymarketClient::new(&config);
 
         Ok(Self {
+            client,
             watcher: MarketWatcher::new(config.clone()),
             auto_trader: AutoTrader::new(auto_params),
             recorder,
@@ -92,10 +127,19 @@ impl App {
             should_quit: false,
             last_up_price: None,
             last_down_price: None,
+            previous_market: None,
+            cached_up_ask_size: None,
+            cached_down_ask_size: None,
             cached_balance: starting_balance,
             cached_pnl: Decimal::ZERO,
             cached_market_slug: None,
             cached_seconds_remaining: None,
+            cached_live_position: LivePositionSummary::default(),
+            cached_history: Vec::new(),
+            pending_settlements: Vec::new(),
+            last_settlement_retry: None,
+            cached_live_balance: None,
+            last_live_balance_fetch: None,
             config,
         })
     }
@@ -191,8 +235,34 @@ impl App {
         // Refresh market if needed
         if let Ok(changed) = self.watcher.refresh_market().await {
             if changed {
-                if let Some(m) = self.watcher.get_current_market().await {
+                let new_market = self.watcher.get_current_market().await;
+
+                // Settle previous market's positions if round changed
+                // Use the CAPTURED final prices from previous_market (not current prices)
+                if let (Some(prev), Some(new)) = (&self.previous_market, &new_market) {
+                    if prev.slug != new.slug && self.paper_mode {
+                        // Settle positions from the previous round using captured final prices
+                        let prev_clone = prev.clone();
+                        if !self.settle_previous_round(prev_clone.clone()).await {
+                            // Add to pending settlements for retry
+                            self.pending_settlements.push(prev_clone);
+                        }
+                    }
+                }
+
+                // Log the new round
+                if let Some(m) = &new_market {
                     self.log(&format!("New round: {}", m.slug));
+
+                    // Update previous market tracker with current prices as initial
+                    // These will be updated each tick until next round change
+                    self.previous_market = Some(PreviousMarket {
+                        slug: m.slug.clone(),
+                        up_token_id: m.up_token_id.clone(),
+                        down_token_id: m.down_token_id.clone(),
+                        final_up_price: self.last_up_price,
+                        final_down_price: self.last_down_price,
+                    });
                 }
             }
         }
@@ -201,6 +271,17 @@ impl App {
         if let Some(m) = self.watcher.get_current_market().await {
             self.cached_market_slug = Some(m.slug.clone());
             self.cached_seconds_remaining = Some(m.seconds_remaining());
+
+            // Initialize previous_market if not set
+            if self.previous_market.is_none() {
+                self.previous_market = Some(PreviousMarket {
+                    slug: m.slug.clone(),
+                    up_token_id: m.up_token_id.clone(),
+                    down_token_id: m.down_token_id.clone(),
+                    final_up_price: None,
+                    final_down_price: None,
+                });
+            }
         } else {
             self.cached_market_slug = None;
             self.cached_seconds_remaining = None;
@@ -210,12 +291,64 @@ impl App {
         self.last_up_price = self.watcher.get_up_price().await;
         self.last_down_price = self.watcher.get_down_price().await;
 
+        // Keep previous_market prices updated for settlement fallback
+        if let Some(ref mut prev) = self.previous_market {
+            prev.final_up_price = self.last_up_price;
+            prev.final_down_price = self.last_down_price;
+        }
+
+        // Update order book sizes for UI
+        if let Some(book) = self.watcher.get_up_book().await {
+            self.cached_up_ask_size = book.ask_size;
+        }
+        if let Some(book) = self.watcher.get_down_book().await {
+            self.cached_down_ask_size = book.ask_size;
+        }
+
         // Update paper trader with current prices
         if self.config.paper_trading.enabled {
             self.paper_trader.update_prices(self.last_up_price, self.last_down_price).await;
             // Update cached values for UI
             self.cached_balance = self.paper_trader.get_balance().await;
             self.cached_pnl = self.paper_trader.get_total_pnl().await;
+
+            // Update cached live position for current round
+            if let Some(slug) = &self.cached_market_slug {
+                self.cached_live_position = self.paper_trader.get_live_position_summary(slug).await;
+            }
+
+            // Update cached history
+            self.cached_history = self.paper_trader.get_settled_rounds().await;
+
+            // Retry any pending settlements (e.g., markets that weren't resolved yet)
+            // Only retry every 30 seconds to avoid spamming logs
+            let should_retry = self.last_settlement_retry
+                .map(|t| t.elapsed() >= Duration::from_secs(30))
+                .unwrap_or(true);
+
+            if should_retry && !self.pending_settlements.is_empty() {
+                self.last_settlement_retry = Some(std::time::Instant::now());
+                self.retry_pending_settlements().await;
+            }
+        }
+
+        // Fetch live trading balance from Polymarket API (every 30 seconds)
+        if !self.paper_mode && self.watcher.client().is_authenticated() {
+            let should_fetch = self.last_live_balance_fetch
+                .map(|t| t.elapsed() >= Duration::from_secs(30))
+                .unwrap_or(true);
+
+            if should_fetch {
+                self.last_live_balance_fetch = Some(std::time::Instant::now());
+                match self.client.get_balance().await {
+                    Ok(balance) => {
+                        self.cached_live_balance = Some(balance);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to fetch live balance: {}", e);
+                    }
+                }
+            }
         }
 
         // Record snapshot
@@ -238,6 +371,91 @@ impl App {
         }
 
         Ok(())
+    }
+
+    /// Settle positions from a previous round
+    /// Returns true if settled, false if deferred
+    async fn settle_previous_round(&mut self, prev: PreviousMarket) -> bool {
+        // Check if we have any positions for this round
+        if !self.paper_trader.has_positions_for_round(&prev.slug).await {
+            return true; // Nothing to settle
+        }
+
+        // Fetch the actual outcome from Polymarket API
+        let winning_side = match self.client.get_market_outcome(&prev.slug).await {
+            Ok(Some(side)) => {
+                self.log(&format!("Fetched outcome for {}: {} won", prev.slug, side));
+                side
+            }
+            Ok(None) => {
+                // Market not yet resolved, defer settlement
+                let short_slug = prev.slug.split('-').last().unwrap_or(&prev.slug);
+                self.log(&format!("[{}] Waiting for {} to resolve...",
+                    Local::now().format("%H:%M:%S"),
+                    short_slug
+                ));
+                return false;
+            }
+            Err(e) => {
+                self.log(&format!("Failed to fetch outcome for {}: {}", prev.slug, e));
+                // Fall back to price-based detection (use captured final prices)
+                if let (Some(up_price), Some(down_price)) = (prev.final_up_price, prev.final_down_price) {
+                    if up_price > down_price {
+                        self.log("Falling back to price-based resolution: UP");
+                        Side::Up
+                    } else {
+                        self.log("Falling back to price-based resolution: DOWN");
+                        Side::Down
+                    }
+                } else {
+                    self.log("No price data available, cannot settle");
+                    return false;
+                }
+            }
+        };
+
+        self.log(&format!(
+            "Settling round {} - {} won",
+            prev.slug, winning_side
+        ));
+
+        match self
+            .paper_trader
+            .settle_round(&prev.up_token_id, &prev.down_token_id, winning_side, &prev.slug)
+            .await
+        {
+            Ok(pnl) => {
+                let pnl_str = if pnl >= Decimal::ZERO {
+                    format!("+${:.2}", pnl)
+                } else {
+                    format!("-${:.2}", pnl.abs())
+                };
+                self.log(&format!("Round settled: {}", pnl_str));
+                true
+            }
+            Err(e) => {
+                self.log(&format!("Settlement error: {}", e));
+                false
+            }
+        }
+    }
+
+    /// Try to settle any pending settlements
+    async fn retry_pending_settlements(&mut self) {
+        if self.pending_settlements.is_empty() {
+            return;
+        }
+
+        let mut still_pending = Vec::new();
+        let pending = std::mem::take(&mut self.pending_settlements);
+
+        for prev in pending {
+            if !self.settle_previous_round(prev.clone()).await {
+                still_pending.push(prev);
+            }
+        }
+
+        self.pending_settlements = still_pending;
     }
 
     /// Handle a command input
@@ -263,6 +481,9 @@ impl App {
             "logs" => self.show_logs().await,
             "balance" | "bal" => self.show_balance().await,
             "positions" | "pos" => self.show_positions().await,
+            "live" => self.show_live_position().await,
+            "history" | "hist" => self.show_history().await,
+            "book" => self.show_order_book().await,
             "pnl" => self.show_pnl().await,
             "trades" => self.show_trades().await,
             "reset" => self.reset_paper_trading().await,
@@ -275,6 +496,7 @@ impl App {
     fn show_help(&mut self) {
         self.log("Available commands:");
         self.log("  status           - Show current market status");
+        self.log("  book             - Show order book (prices + sizes)");
         self.log("  buy up <usd>     - Buy UP shares for USD amount");
         self.log("  buy down <usd>   - Buy DOWN shares for USD amount");
         self.log("  buyshares up <n> - Buy N UP shares at best ask");
@@ -287,7 +509,9 @@ impl App {
         self.log("  mode live        - Switch to live trading (requires confirmation)");
         self.log("  logs             - Show strategy logs");
         self.log("  balance (bal)    - Show trading balance");
-        self.log("  positions (pos)  - Show current positions");
+        self.log("  positions (pos)  - Show all open positions");
+        self.log("  live             - Show live position for current round");
+        self.log("  history (hist)   - Show settled rounds history");
         self.log("  pnl              - Show profit/loss summary");
         self.log("  trades           - Show recent trades");
         self.log("  reset            - Reset paper trading balance/history");
@@ -359,11 +583,17 @@ impl App {
         let shares = amount / price;
 
         if self.config.paper_trading.enabled {
-            // Execute paper trade
-            let round_slug = self.watcher.get_current_market().await
-                .map(|m| m.slug.clone())
-                .unwrap_or_else(|| "unknown".to_string());
-            let token_id = format!("{}_{}", round_slug, side.as_str().to_lowercase());
+            // Execute paper trade - use actual token IDs from market
+            let market = self.watcher.get_current_market().await;
+            let Some(market) = market else {
+                self.log("No active market");
+                return;
+            };
+            let round_slug = market.slug.clone();
+            let token_id = match side {
+                Side::Up => market.up_token_id.clone(),
+                Side::Down => market.down_token_id.clone(),
+            };
 
             match self.paper_trader.buy(&token_id, side, shares, price, &round_slug).await {
                 Ok(result) => {
@@ -420,11 +650,17 @@ impl App {
         };
 
         if self.config.paper_trading.enabled {
-            // Execute paper trade
-            let round_slug = self.watcher.get_current_market().await
-                .map(|m| m.slug.clone())
-                .unwrap_or_else(|| "unknown".to_string());
-            let token_id = format!("{}_{}", round_slug, side.as_str().to_lowercase());
+            // Execute paper trade - use actual token IDs from market
+            let market = self.watcher.get_current_market().await;
+            let Some(market) = market else {
+                self.log("No active market");
+                return;
+            };
+            let round_slug = market.slug.clone();
+            let token_id = match side {
+                Side::Up => market.up_token_id.clone(),
+                Side::Down => market.down_token_id.clone(),
+            };
 
             match self.paper_trader.buy(&token_id, side, shares, price, &round_slug).await {
                 Ok(result) => {
@@ -691,6 +927,120 @@ impl App {
         ));
     }
 
+    async fn show_live_position(&mut self) {
+        if !self.config.paper_trading.enabled {
+            self.log("Paper trading is disabled");
+            return;
+        }
+
+        let Some(slug) = &self.cached_market_slug else {
+            self.log("No active market");
+            return;
+        };
+
+        let summary = self.paper_trader.get_live_position_summary(slug).await;
+
+        if summary.up_shares == Decimal::ZERO && summary.down_shares == Decimal::ZERO {
+            self.log("No positions for current round");
+            return;
+        }
+
+        self.log(&format!("Live Position for {}:", slug));
+        if summary.up_shares > Decimal::ZERO {
+            self.log(&format!(
+                "  UP:   {} shares @ ${:.4} avg",
+                summary.up_shares, summary.up_avg_price
+            ));
+        }
+        if summary.down_shares > Decimal::ZERO {
+            self.log(&format!(
+                "  DOWN: {} shares @ ${:.4} avg",
+                summary.down_shares, summary.down_avg_price
+            ));
+        }
+
+        // Show arbitrage info if we have both sides
+        if let Some(avg_cost) = summary.avg_cost_per_pair {
+            let profit_margin = Decimal::ONE - avg_cost;
+            let profit_pct = (profit_margin / avg_cost) * Decimal::ONE_HUNDRED;
+            let status = if avg_cost < Decimal::ONE {
+                format!("PROFITABLE ({:.2}%)", profit_pct)
+            } else {
+                "LOSS".to_string()
+            };
+            self.log(&format!("  Avg cost/pair: ${:.4} - {}", avg_cost, status));
+        }
+    }
+
+    async fn show_history(&mut self) {
+        if !self.config.paper_trading.enabled {
+            self.log("Paper trading is disabled");
+            return;
+        }
+
+        let history = self.paper_trader.get_settled_rounds().await;
+
+        if history.is_empty() {
+            self.log("No settled rounds yet");
+            return;
+        }
+
+        self.log("Settled Rounds History:");
+        for round in history.iter().rev().take(10) {
+            let pnl_str = if round.net_pnl >= Decimal::ZERO {
+                format!("+${:.2}", round.net_pnl)
+            } else {
+                format!("-${:.2}", round.net_pnl.abs())
+            };
+
+            // Extract just the timestamp part from slug
+            let short_slug = round.round_slug.split('-').last().unwrap_or(&round.round_slug);
+
+            self.log(&format!(
+                "  {} | {} won | Cost ${:.2} -> Payout ${:.2} | {}",
+                short_slug,
+                round.winning_side,
+                round.total_cost,
+                round.total_payout,
+                pnl_str
+            ));
+        }
+    }
+
+    async fn show_order_book(&mut self) {
+        let up_book = self.watcher.get_up_book().await;
+        let down_book = self.watcher.get_down_book().await;
+
+        self.log("Order Book:");
+
+        if let Some(book) = up_book {
+            let ask_str = book.best_ask.map(|p| format!("${:.4}", p)).unwrap_or_else(|| "---".to_string());
+            let size_str = book.ask_size.map(|s| format!("{:.2}", s)).unwrap_or_else(|| "---".to_string());
+            self.log(&format!("  UP:   {} x {} (ask)", ask_str, size_str));
+        } else {
+            self.log("  UP:   No data");
+        }
+
+        if let Some(book) = down_book {
+            let ask_str = book.best_ask.map(|p| format!("${:.4}", p)).unwrap_or_else(|| "---".to_string());
+            let size_str = book.ask_size.map(|s| format!("{:.2}", s)).unwrap_or_else(|| "---".to_string());
+            self.log(&format!("  DOWN: {} x {} (ask)", ask_str, size_str));
+        } else {
+            self.log("  DOWN: No data");
+        }
+
+        // Show sum
+        if let (Some(up_price), Some(down_price)) = (self.last_up_price, self.last_down_price) {
+            let sum = up_price + down_price;
+            let arb_status = if sum < Decimal::ONE {
+                format!("ARB: {:.2}% profit potential", (Decimal::ONE - sum) * Decimal::ONE_HUNDRED)
+            } else {
+                "No arbitrage".to_string()
+            };
+            self.log(&format!("  SUM: ${:.4} - {}", sum, arb_status));
+        }
+    }
+
     fn log(&mut self, msg: &str) {
         self.messages.push(msg.to_string());
         // Keep only last 100 messages
@@ -733,14 +1083,47 @@ impl App {
     }
 
     pub fn is_paper_trading(&self) -> bool {
-        self.config.paper_trading.enabled
+        self.config.paper_trading.enabled && self.paper_mode
     }
 
-    pub fn paper_balance(&self) -> Decimal {
-        self.cached_balance
+    pub fn is_live_trading(&self) -> bool {
+        !self.paper_mode && self.watcher.client().is_authenticated()
     }
 
-    pub fn paper_pnl(&self) -> Decimal {
-        self.cached_pnl
+    /// Get current trading balance (paper or live)
+    pub fn trading_balance(&self) -> Decimal {
+        if self.paper_mode {
+            self.cached_balance
+        } else {
+            // Live trading - use cached balance from API
+            self.cached_live_balance.unwrap_or(Decimal::ZERO)
+        }
+    }
+
+    /// Get realized P&L (paper only - live P&L requires session tracking)
+    pub fn trading_pnl(&self) -> Decimal {
+        if self.paper_mode {
+            self.cached_pnl
+        } else {
+            // Live trading - P&L requires tracking session start balance
+            // For now, show 0 since we don't track session start
+            Decimal::ZERO
+        }
+    }
+
+    pub fn up_ask_size(&self) -> Option<Decimal> {
+        self.cached_up_ask_size
+    }
+
+    pub fn down_ask_size(&self) -> Option<Decimal> {
+        self.cached_down_ask_size
+    }
+
+    pub fn live_position(&self) -> &LivePositionSummary {
+        &self.cached_live_position
+    }
+
+    pub fn settled_history(&self) -> &[SettledRound] {
+        &self.cached_history
     }
 }
