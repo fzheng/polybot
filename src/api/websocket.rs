@@ -137,14 +137,41 @@ impl PriceStream {
 
     /// Start streaming prices for given tokens
     pub async fn start(&self, token_ids: Vec<String>) -> Result<()> {
+        // Check if we need to restart with new tokens
         {
-            let mut running = self.running.write().await;
-            if *running {
+            let current_tokens = self.subscribed_tokens.read().await;
+            let running = self.running.read().await;
+
+            // If already running with the same tokens, no need to restart
+            if *running && *current_tokens == token_ids {
                 return Ok(());
             }
-            *running = true;
         }
 
+        // Stop existing stream if running
+        {
+            let mut running = self.running.write().await;
+            *running = false;
+        }
+
+        // Give the old task a moment to notice the stop signal
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // Clear old order books and price history for fresh start
+        {
+            let mut books = self.order_books.write().await;
+            books.clear();
+        }
+        {
+            let mut history = self.price_history.write().await;
+            history.clear();
+        }
+
+        // Update tokens and mark as running
+        {
+            let mut running = self.running.write().await;
+            *running = true;
+        }
         {
             let mut tokens = self.subscribed_tokens.write().await;
             *tokens = token_ids.clone();
