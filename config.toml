@@ -24,7 +24,8 @@ signature_type = 0
 # Default number of shares per trade
 default_shares = 10
 
-# Default sum target for hedge condition (leg1_price + opposite_ask <= sum_target)
+# Sum target for hedge condition (leg1_price + opposite_ask <= sum_target)
+# Uses theta decay in last 5 minutes (decays toward 0.99 like options time value)
 default_sum_target = 0.95
 
 # Default dump threshold percentage (0.15 = 15%)
@@ -32,6 +33,10 @@ default_move_pct = 0.15
 
 # Default window in minutes for Leg 1 (only buy during first N minutes)
 default_window_min = 2
+
+# Maximum cycles (Leg1+Leg2 pairs) per round
+# Set to 1 for conservative, higher for more aggressive
+default_max_cycles = 1
 
 # Dump detection window in seconds
 dump_window_secs = 3

@@ -121,6 +121,7 @@ pub struct TradingConfig {
 
     /// Default sum target for hedge condition.
     /// Leg 2 triggers when: `leg1_price + opposite_ask <= sum_target`
+    /// Uses theta decay in last 5 minutes (decays toward 0.99).
     #[serde(default = "default_sum_target")]
     pub default_sum_target: Decimal,
 
@@ -133,6 +134,11 @@ pub struct TradingConfig {
     /// Strategy only watches for dumps during this initial window.
     #[serde(default = "default_window_min")]
     pub default_window_min: u32,
+
+    /// Maximum cycles per round (Leg1+Leg2 pairs).
+    /// Set to 1 for conservative, higher for more aggressive.
+    #[serde(default = "default_max_cycles")]
+    pub default_max_cycles: u32,
 
     /// Dump detection window in seconds.
     /// How far back to look for price drops.
@@ -237,6 +243,10 @@ fn default_window_min() -> u32 {
     2
 }
 
+fn default_max_cycles() -> u32 {
+    1
+}
+
 fn default_dump_window_secs() -> u64 {
     3
 }
@@ -309,6 +319,7 @@ impl Default for Config {
                 default_sum_target: default_sum_target(),
                 default_move_pct: default_move_pct(),
                 default_window_min: default_window_min(),
+                default_max_cycles: default_max_cycles(),
                 dump_window_secs: default_dump_window_secs(),
                 market_pattern: default_market_pattern(),
             },

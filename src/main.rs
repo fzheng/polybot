@@ -11,9 +11,6 @@
 //!
 //! # With verbose logging to file
 //! cargo run --release -- --verbose --log-file polybot.log
-//!
-//! # Record-only mode (no trading)
-//! cargo run --release -- --record-only
 //! ```
 //!
 //! # Architecture
@@ -58,12 +55,6 @@ struct Args {
     /// Defaults to config.toml in current directory.
     #[arg(short, long, default_value = "config.toml")]
     config: String,
-
-    /// Run in record-only mode.
-    /// Collects price data without executing any trades.
-    /// Useful for backtesting data collection.
-    #[arg(long)]
-    record_only: bool,
 
     /// Log to file instead of suppressing logs.
     /// Console logging is disabled by default because it
@@ -116,7 +107,7 @@ async fn main() -> Result<()> {
     let config = Config::load(&args.config)?;
 
     // Run the terminal application
-    let mut app = App::new(config, args.record_only).await?;
+    let mut app = App::new(config).await?;
     app.run().await?;
 
     Ok(())

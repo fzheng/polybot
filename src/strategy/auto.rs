@@ -34,6 +34,8 @@ pub struct AutoTrader {
     params: Arc<RwLock<AutoParams>>,
     state: Arc<RwLock<StrategyState>>,
     current_round: Arc<RwLock<Option<String>>>,
+    /// Count of cycles completed for the current round (compared against max_cycles)
+    cycles_this_round: Arc<RwLock<u32>>,
     leg1_info: Arc<RwLock<Option<Leg1Info>>>,
     leg1_result: Arc<RwLock<Option<TradeResult>>>,
     leg2_result: Arc<RwLock<Option<TradeResult>>>,
@@ -49,6 +51,7 @@ impl AutoTrader {
             params: Arc::new(RwLock::new(params)),
             state: Arc::new(RwLock::new(StrategyState::Watching)),
             current_round: Arc::new(RwLock::new(None)),
+            cycles_this_round: Arc::new(RwLock::new(0)),
             leg1_info: Arc::new(RwLock::new(None)),
             leg1_result: Arc::new(RwLock::new(None)),
             leg2_result: Arc::new(RwLock::new(None)),
@@ -61,8 +64,9 @@ impl AutoTrader {
     /// Update parameters
     pub async fn set_params(&self, params: AutoParams) {
         let msg = format!(
-            "Params updated: shares={}, sum={}, move={}%, window={}min",
-            params.shares, params.sum_target, params.move_pct * Decimal::ONE_HUNDRED, params.window_min
+            "Params updated: shares={}, sum={}, move={}%, window={}min, cycles={}",
+            params.shares, params.sum_target,
+            params.move_pct * Decimal::ONE_HUNDRED, params.window_min, params.max_cycles
         );
         let mut p = self.params.write().await;
         *p = params;
@@ -105,7 +109,11 @@ impl AutoTrader {
         {
             let mut round = self.current_round.write().await;
             if *round != current_slug {
-                // Round changed - abandon current cycle
+                // Round changed - reset cycle counter for new round
+                let mut cycles = self.cycles_this_round.write().await;
+                *cycles = 0;
+
+                // Abandon current cycle if in progress
                 if round.is_some() && self.get_state().await != StrategyState::Watching {
                     self.log("Round changed - abandoning cycle").await;
                     if let Some(pt) = paper_trader {
@@ -119,6 +127,16 @@ impl AutoTrader {
             }
         }
 
+        // Check if we've reached max cycles for this round
+        let params = self.params.read().await;
+        let max_cycles = params.max_cycles;
+        drop(params);
+
+        let cycles = *self.cycles_this_round.read().await;
+        if cycles >= max_cycles {
+            return Ok(()); // Don't start another cycle in the same round
+        }
+
         // Process based on current state
         let state = self.get_state().await;
 
@@ -130,8 +148,15 @@ impl AutoTrader {
                 self.watch_for_hedge(watcher, paper_trader, leg1_side, leg1_price).await?;
             }
             StrategyState::Completed => {
-                // Reset for next cycle
+                // Increment cycle counter and reset state
+                let mut cycles = self.cycles_this_round.write().await;
+                *cycles += 1;
+                let current = *cycles;
+                drop(cycles);
+
                 self.reset_cycle().await;
+                self.log(&format!("Cycle {} complete - {} for next round", current,
+                    if current >= max_cycles { "waiting" } else { "ready" })).await;
             }
         }
 
@@ -257,11 +282,18 @@ impl AutoTrader {
             let sum_target = params.sum_target;
             drop(params);
 
+            // Calculate time-decayed sum target (options-like theta decay)
+            // Stays strict for first 10 min, then decays toward 0.99 in last 5 min
+            let effective_sum_target = self.calculate_decayed_target(
+                watcher,
+                sum_target,
+            ).await;
+
             // Check hedge condition
-            if sum <= sum_target {
+            if sum <= effective_sum_target {
                 self.log(&format!(
                     "Hedge condition met! {:.4} + {:.4} = {:.4} <= {:.4}",
-                    leg1_price, ask, sum, sum_target
+                    leg1_price, ask, sum, effective_sum_target
                 )).await;
 
                 if let Err(e) = self.execute_leg2(watcher, paper_trader, opposite_side, ask).await {
@@ -359,6 +391,55 @@ impl AutoTrader {
 
         let mut leg2 = self.leg2_result.write().await;
         *leg2 = None;
+    }
+
+    /// Calculate time-decayed sum target based on time remaining in round.
+    ///
+    /// Uses options-like theta decay: stays flat for most of the round,
+    /// then decays sharply in the final minutes (similar to how options
+    /// lose time value exponentially as expiration approaches).
+    ///
+    /// - First 10 minutes: No decay, uses strict sum_target
+    /// - Last 5 minutes: Exponential decay from sum_target toward 0.99
+    ///
+    /// The decay follows: target = sum_target + (0.99 - sum_target) * (1 - e^(-k*progress))
+    /// where progress goes from 0 to 1 over the last 5 minutes.
+    async fn calculate_decayed_target(
+        &self,
+        watcher: &MarketWatcher,
+        sum_target: Decimal,
+    ) -> Decimal {
+        const DECAY_WINDOW_SECS: i64 = 300; // Last 5 minutes
+        const MAX_TARGET: &str = "0.99"; // Never exceed this (1% minimum profit)
+
+        let seconds_remaining = watcher.get_seconds_remaining().await.unwrap_or(900);
+
+        if seconds_remaining >= DECAY_WINDOW_SECS {
+            // Still plenty of time - use strict target (no decay)
+            return sum_target;
+        }
+
+        if seconds_remaining <= 0 {
+            // Round ended
+            return Decimal::from_str_exact(MAX_TARGET).unwrap();
+        }
+
+        // Exponential decay similar to options theta
+        // progress: 0.0 at 300s remaining, 1.0 at 0s remaining
+        let progress = (DECAY_WINDOW_SECS - seconds_remaining) as f64 / DECAY_WINDOW_SECS as f64;
+
+        // Decay constant - higher = faster decay. 3.0 gives ~95% decay at expiry
+        let k = 3.0_f64;
+        let decay_factor = 1.0 - (-k * progress).exp();
+
+        let max_target = Decimal::from_str_exact(MAX_TARGET).unwrap();
+        let range = max_target - sum_target;
+
+        // Convert decay_factor to Decimal (multiply by 1000, divide later for precision)
+        let decay_factor_decimal = Decimal::from_f64_retain(decay_factor)
+            .unwrap_or(Decimal::ZERO);
+
+        sum_target + (range * decay_factor_decimal)
     }
 
     /// Add a log entry

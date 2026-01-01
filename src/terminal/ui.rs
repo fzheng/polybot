@@ -11,6 +11,20 @@ use rust_decimal::Decimal;
 
 use super::app::App;
 
+/// Format seconds remaining as "Xm Ys" or "Ys" if less than 1 minute
+fn format_time_remaining(seconds: i64) -> String {
+    if seconds < 0 {
+        return "0s".to_string();
+    }
+    if seconds < 60 {
+        format!("{}s", seconds)
+    } else {
+        let mins = seconds / 60;
+        let secs = seconds % 60;
+        format!("{}m {}s", mins, secs)
+    }
+}
+
 /// Draw the main UI
 pub fn draw(f: &mut Frame, app: &App) {
     // Main layout: header row, middle row (positions + history), log, input
@@ -127,8 +141,6 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
         Span::styled("LIVE", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
     };
 
-    let snapshots = app.recorder_snapshots();
-
     let mut text = vec![
         Line::from(vec![
             Span::raw("Market: "),
@@ -141,7 +153,7 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
             Span::raw("Time:   "),
             Span::styled(
                 app.seconds_remaining()
-                    .map(|s| format!("{}s", s))
+                    .map(|s| format_time_remaining(s))
                     .unwrap_or_else(|| "---".to_string()),
                 Style::default().fg(Color::Magenta),
             ),
@@ -152,39 +164,33 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
         ]),
     ];
 
-    // Show balance and P&L (paper or live) or recording status
-    if app.is_paper_trading() || app.is_live_trading() {
-        let pnl = app.trading_pnl();
-        let pnl_color = if pnl >= Decimal::ZERO { Color::Green } else { Color::Red };
-        let pnl_sign = if pnl >= Decimal::ZERO { "+" } else { "-" };
+    // Show balance and P&L
+    let pnl = app.trading_pnl();
+    let pnl_color = if pnl >= Decimal::ZERO { Color::Green } else { Color::Red };
+    let pnl_sign = if pnl >= Decimal::ZERO { "+" } else { "-" };
 
-        text.push(Line::from(vec![
-            Span::styled("Bal: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                format!("${:.2}", app.trading_balance()),
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("  P&L: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                format!("{}${:.2}", pnl_sign, pnl.abs()),
-                Style::default().fg(pnl_color).add_modifier(Modifier::BOLD),
-            ),
-        ]));
+    text.push(Line::from(vec![
+        Span::styled("Bal: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("${:.2}", app.trading_balance()),
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("  P&L: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("{}${:.2}", pnl_sign, pnl.abs()),
+            Style::default().fg(pnl_color).add_modifier(Modifier::BOLD),
+        ),
+    ]));
+
+    let (title, border_color) = if app.is_paper_trading() {
+        (" Paper Trading ", Color::Yellow)
     } else {
-        text.push(Line::from(vec![
-            Span::raw("Rec:    "),
-            Span::styled(
-                format!("{} snapshots", snapshots),
-                Style::default().fg(Color::Blue),
-            ),
-        ]));
-    }
-
-    let title = if app.is_paper_trading() { " Paper Trading " } else { " Status " };
+        (" Live Trading ", Color::Red)
+    };
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(if app.is_paper_trading() { Color::Yellow } else { Color::Cyan }));
+        .border_style(Style::default().fg(border_color));
 
     let paragraph = Paragraph::new(text).block(block);
     f.render_widget(paragraph, area);

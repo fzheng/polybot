@@ -44,7 +44,6 @@ pub struct App {
     auto_trader: AutoTrader,
     recorder: Recorder,
     paper_trader: PaperTrader,
-    record_only: bool,
     paper_mode: bool,  // true = paper trading, false = live trading
     pending_mode_switch: Option<bool>,  // Pending mode switch awaiting confirmation
 
@@ -79,16 +78,20 @@ pub struct App {
     // Cached state for live trading (fetched from Polymarket API)
     cached_live_balance: Option<Decimal>,
     last_live_balance_fetch: Option<std::time::Instant>,
+
+    // Track how many strategy logs we've already shown in UI
+    last_strategy_log_count: usize,
 }
 
 impl App {
     /// Create a new application
-    pub async fn new(config: Config, record_only: bool) -> Result<Self> {
+    pub async fn new(config: Config) -> Result<Self> {
         let auto_params = AutoParams {
             shares: config.trading.default_shares,
             sum_target: config.trading.default_sum_target,
             move_pct: config.trading.default_move_pct,
             window_min: config.trading.default_window_min,
+            max_cycles: config.trading.default_max_cycles,
         };
 
         let recorder = Recorder::new(config.recording.clone())?;
@@ -119,7 +122,6 @@ impl App {
             auto_trader: AutoTrader::new(auto_params),
             recorder,
             paper_trader,
-            record_only,
             paper_mode,
             pending_mode_switch: None,
             input: String::new(),
@@ -140,6 +142,7 @@ impl App {
             last_settlement_retry: None,
             cached_live_balance: None,
             last_live_balance_fetch: None,
+            last_strategy_log_count: 0,
             config,
         })
     }
@@ -358,16 +361,37 @@ impl App {
             }
         }
 
-        // Run auto trader (if not in record-only mode)
-        if !self.record_only {
-            let paper_trader = if self.paper_mode {
-                Some(&self.paper_trader)
-            } else {
-                None
-            };
-            if let Err(e) = self.auto_trader.tick(&self.watcher, paper_trader).await {
-                self.log(&format!("Strategy error: {}", e));
+        // Run auto trader
+        let paper_trader = if self.paper_mode {
+            Some(&self.paper_trader)
+        } else {
+            None
+        };
+        if let Err(e) = self.auto_trader.tick(&self.watcher, paper_trader).await {
+            self.log(&format!("Strategy error: {}", e));
+        }
+
+        // Forward new strategy logs to UI
+        let strategy_logs = self.auto_trader.get_logs().await;
+        if strategy_logs.len() > self.last_strategy_log_count {
+            for log in strategy_logs.iter().skip(self.last_strategy_log_count) {
+                // Only show important logs (LEG, COMPLETE, PAPER, LIVE, errors)
+                if log.message.contains("LEG")
+                    || log.message.contains("COMPLETE")
+                    || log.message.contains("[PAPER]")
+                    || log.message.contains("[LIVE]")
+                    || log.message.contains("Dump")
+                    || log.message.contains("Hedge")
+                    || log.is_error
+                {
+                    self.messages.push(format!("[Auto] {}", log.message));
+                    // Keep only last 100 messages
+                    if self.messages.len() > 100 {
+                        self.messages.remove(0);
+                    }
+                }
             }
+            self.last_strategy_log_count = strategy_logs.len();
         }
 
         Ok(())
@@ -471,78 +495,35 @@ impl App {
 
         match parts[0].to_lowercase().as_str() {
             "help" => self.show_help(),
-            "status" => self.show_status().await,
             "buy" => self.handle_buy(&parts).await,
             "buyshares" => self.handle_buyshares(&parts).await,
             "params" => self.handle_params(&parts).await,
             "mode" => self.handle_mode(&parts).await,
             "yes" | "y" => self.confirm_mode_switch().await,
             "no" | "n" => self.cancel_mode_switch(),
-            "logs" => self.show_logs().await,
             "balance" | "bal" => self.show_balance().await,
             "positions" | "pos" => self.show_positions().await,
-            "live" => self.show_live_position().await,
-            "history" | "hist" => self.show_history().await,
             "book" => self.show_order_book().await,
-            "pnl" => self.show_pnl().await,
             "trades" => self.show_trades().await,
             "reset" => self.reset_paper_trading().await,
             "quit" | "exit" | "q" => self.should_quit = true,
-            "clear" => self.messages.clear(),
             _ => self.log(&format!("Unknown command: {}", parts[0])),
         }
     }
 
     fn show_help(&mut self) {
-        self.log("Available commands:");
-        self.log("  status           - Show current market status");
-        self.log("  book             - Show order book (prices + sizes)");
-        self.log("  buy up <usd>     - Buy UP shares for USD amount");
-        self.log("  buy down <usd>   - Buy DOWN shares for USD amount");
-        self.log("  buyshares up <n> - Buy N UP shares at best ask");
-        self.log("  buyshares down <n> - Buy N DOWN shares at best ask");
-        self.log("  params           - Show current strategy parameters");
-        self.log("  params <shares> [sum] [move] [window]");
-        self.log("                   - Update strategy parameters");
-        self.log("  mode             - Show current trading mode");
-        self.log("  mode paper       - Switch to paper trading");
-        self.log("  mode live        - Switch to live trading (requires confirmation)");
-        self.log("  logs             - Show strategy logs");
-        self.log("  balance (bal)    - Show trading balance");
-        self.log("  positions (pos)  - Show all open positions");
-        self.log("  live             - Show live position for current round");
-        self.log("  history (hist)   - Show settled rounds history");
-        self.log("  pnl              - Show profit/loss summary");
-        self.log("  trades           - Show recent trades");
-        self.log("  reset            - Reset paper trading balance/history");
-        self.log("  clear            - Clear message log");
-        self.log("  quit             - Exit the bot");
-    }
-
-    async fn show_status(&mut self) {
-        let market = self.watcher.get_current_market().await;
-
-        if let Some(m) = market {
-            self.log(&format!("Market: {}", m.slug));
-            self.log(&format!("Time remaining: {}s", m.seconds_remaining()));
-
-            if let Some(up) = self.last_up_price {
-                self.log(&format!("UP:   ${:.4}", up));
-            }
-            if let Some(down) = self.last_down_price {
-                self.log(&format!("DOWN: ${:.4}", down));
-            }
-
-            if let (Some(up), Some(down)) = (self.last_up_price, self.last_down_price) {
-                self.log(&format!("SUM:  ${:.4}", up + down));
-            }
-        } else {
-            self.log("No active market found");
-        }
-
-        let state = self.auto_trader.get_state().await;
-        let mode = if self.paper_mode { "PAPER" } else { "LIVE" };
-        self.log(&format!("Mode: {} | State: {:?}", mode, state));
+        self.log("Commands:");
+        self.log("  buy up|down <usd>     - Buy shares for USD amount");
+        self.log("  buyshares up|down <n> - Buy N shares at best ask");
+        self.log("  params [shares] [sum] [move] [window]");
+        self.log("                        - Show/update strategy params");
+        self.log("  mode paper|live       - Switch trading mode");
+        self.log("  book                  - Show order book details");
+        self.log("  balance               - Show detailed balance");
+        self.log("  positions             - Show all positions by token");
+        self.log("  trades                - Show recent trades");
+        self.log("  reset                 - Reset paper trading");
+        self.log("  quit                  - Exit");
     }
 
     async fn handle_buy(&mut self, parts: &[&str]) {
@@ -689,12 +670,13 @@ impl App {
             // Show current params
             let params = self.auto_trader.get_params().await;
             self.log("Current strategy parameters:");
-            self.log(&format!("  shares:    {}", params.shares));
-            self.log(&format!("  sum:       {}", params.sum_target));
-            self.log(&format!("  move:      {}%", params.move_pct * Decimal::ONE_HUNDRED));
-            self.log(&format!("  window:    {} min", params.window_min));
+            self.log(&format!("  shares:     {}", params.shares));
+            self.log(&format!("  sum:        {} (theta decay to 0.99 in last 5 min)", params.sum_target));
+            self.log(&format!("  move:       {}%", params.move_pct * Decimal::ONE_HUNDRED));
+            self.log(&format!("  window:     {} min", params.window_min));
+            self.log(&format!("  max_cycles: {}", params.max_cycles));
             self.log("");
-            self.log("To update: params <shares> [sum] [move] [window]");
+            self.log("To update: params <shares> [sum] [move] [window] [cycles]");
             return;
         }
 
@@ -719,27 +701,28 @@ impl App {
             .and_then(|s| s.parse().ok())
             .unwrap_or(2u32);
 
+        let max_cycles = parts.get(5)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1u32);
+
         let new_params = AutoParams {
             shares,
             sum_target: sum,
             move_pct,
             window_min: window,
+            max_cycles,
         };
         self.auto_trader.set_params(new_params).await;
 
         self.log(&format!(
-            "Params updated: {} shares, sum={}, move={}%, window={}min",
-            shares, sum, move_pct * Decimal::ONE_HUNDRED, window
+            "Params updated: {} shares, sum={}, move={}%, window={}min, cycles={}",
+            shares, sum, move_pct * Decimal::ONE_HUNDRED, window, max_cycles
         ));
     }
 
     async fn handle_mode(&mut self, parts: &[&str]) {
         if parts.len() < 2 {
-            // Show current mode
-            let mode = if self.paper_mode { "PAPER" } else { "LIVE" };
-            self.log(&format!("Current mode: {}", mode));
-            self.log("");
-            self.log("To switch: mode paper | mode live");
+            self.log("Usage: mode paper | mode live");
             return;
         }
 
@@ -795,23 +778,6 @@ impl App {
         }
     }
 
-    async fn show_logs(&mut self) {
-        let logs = self.auto_trader.get_logs().await;
-        if logs.is_empty() {
-            self.log("No strategy logs yet");
-        } else {
-            self.log("Strategy logs:");
-            for log in logs.iter().rev().take(10) {
-                let prefix = if log.is_error { "ERROR" } else { "INFO" };
-                self.log(&format!("  [{}] {}: {}",
-                    log.timestamp.format("%H:%M:%S"),
-                    prefix,
-                    log.message
-                ));
-            }
-        }
-    }
-
     async fn show_balance(&mut self) {
         if !self.config.paper_trading.enabled {
             self.log("Paper trading is disabled");
@@ -855,59 +821,74 @@ impl App {
         }
     }
 
-    async fn show_pnl(&mut self) {
-        if !self.config.paper_trading.enabled {
-            self.log("Paper trading is disabled");
-            return;
-        }
-
-        let stats = self.paper_trader.get_stats().await;
-        let total_pnl = self.paper_trader.get_total_pnl().await;
-
-        self.log("Paper Trading P&L Summary:");
-        self.log(&format!("  Total P&L:     ${:.2}", total_pnl));
-        self.log(&format!("  Realized:      ${:.2}", stats.realized_pnl));
-        self.log(&format!("  Unrealized:    ${:.2}", stats.unrealized_pnl));
-        self.log(&format!("  Total trades:  {}", stats.total_trades));
-        self.log(&format!("  Winners:       {}", stats.winning_trades));
-        self.log(&format!("  Losers:        {}", stats.losing_trades));
-        self.log(&format!("  Total fees:    ${:.2}", stats.total_fees));
-        self.log(&format!("  Total slippage: ${:.2}", stats.total_slippage));
-        if stats.best_trade > Decimal::ZERO {
-            self.log(&format!("  Best trade:    ${:.2}", stats.best_trade));
-        }
-        if stats.worst_trade < Decimal::ZERO {
-            self.log(&format!("  Worst trade:   ${:.2}", stats.worst_trade));
-        }
-        self.log(&format!("  Cycles done:   {}", stats.cycles_completed));
-        self.log(&format!("  Abandoned:     {}", stats.cycles_abandoned));
-    }
-
     async fn show_trades(&mut self) {
         if !self.config.paper_trading.enabled {
             self.log("Paper trading is disabled");
             return;
         }
 
-        let trades = self.paper_trader.get_recent_trades(10).await;
+        let trades = self.paper_trader.get_recent_trades(20).await;
         if trades.is_empty() {
             self.log("No trades yet");
         } else {
-            self.log("Recent trades:");
+            self.log("Recent trades (grouped by round):");
+
+            // Group trades by round_slug
+            let mut by_round: std::collections::HashMap<String, Vec<_>> = std::collections::HashMap::new();
             for trade in trades {
-                let action = match trade.buy_sell {
-                    crate::types::BuySell::Buy => "BUY",
-                    crate::types::BuySell::Sell => "SELL",
+                by_round.entry(trade.round_slug.clone()).or_default().push(trade);
+            }
+
+            // Sort rounds by most recent trade timestamp
+            let mut rounds: Vec<_> = by_round.into_iter().collect();
+            rounds.sort_by(|a, b| {
+                let a_time = a.1.iter().map(|t| t.timestamp).max();
+                let b_time = b.1.iter().map(|t| t.timestamp).max();
+                b_time.cmp(&a_time) // Most recent first
+            });
+
+            for (round_slug, round_trades) in rounds.iter().take(5) {
+                // Extract just the timestamp part from slug for brevity
+                let short_slug = round_slug.split('-').last().unwrap_or(round_slug);
+
+                // Calculate totals for this round
+                let mut up_shares = Decimal::ZERO;
+                let mut down_shares = Decimal::ZERO;
+                let mut total_cost = Decimal::ZERO;
+
+                for trade in round_trades {
+                    match trade.side {
+                        crate::types::Side::Up => up_shares += trade.shares,
+                        crate::types::Side::Down => down_shares += trade.shares,
+                    }
+                    total_cost += trade.total_cost;
+                }
+
+                // Show round header with summary
+                let balance_str = if up_shares == down_shares && up_shares > Decimal::ZERO {
+                    "BALANCED".to_string()
+                } else if up_shares > Decimal::ZERO && down_shares > Decimal::ZERO {
+                    format!("IMBALANCED: {}U/{}D", up_shares, down_shares)
+                } else {
+                    format!("{}U/{}D", up_shares, down_shares)
                 };
-                self.log(&format!(
-                    "  [{}] {} {} {} @ ${:.4} (fee: ${:.4})",
-                    trade.timestamp.format("%H:%M:%S"),
-                    action,
-                    trade.shares,
-                    trade.side,
-                    trade.price,
-                    trade.fee
-                ));
+
+                self.log(&format!("  [{}] ${:.2} - {}", short_slug, total_cost, balance_str));
+
+                // Show individual trades
+                for trade in round_trades {
+                    let action = match trade.buy_sell {
+                        crate::types::BuySell::Buy => "BUY",
+                        crate::types::BuySell::Sell => "SELL",
+                    };
+                    self.log(&format!(
+                        "    {} {} {} @ ${:.4}",
+                        action,
+                        trade.shares,
+                        trade.side,
+                        trade.price
+                    ));
+                }
             }
         }
     }
@@ -925,86 +906,6 @@ impl App {
             "Paper trading reset. Balance: ${:.2}",
             self.cached_balance
         ));
-    }
-
-    async fn show_live_position(&mut self) {
-        if !self.config.paper_trading.enabled {
-            self.log("Paper trading is disabled");
-            return;
-        }
-
-        let Some(slug) = &self.cached_market_slug else {
-            self.log("No active market");
-            return;
-        };
-
-        let summary = self.paper_trader.get_live_position_summary(slug).await;
-
-        if summary.up_shares == Decimal::ZERO && summary.down_shares == Decimal::ZERO {
-            self.log("No positions for current round");
-            return;
-        }
-
-        self.log(&format!("Live Position for {}:", slug));
-        if summary.up_shares > Decimal::ZERO {
-            self.log(&format!(
-                "  UP:   {} shares @ ${:.4} avg",
-                summary.up_shares, summary.up_avg_price
-            ));
-        }
-        if summary.down_shares > Decimal::ZERO {
-            self.log(&format!(
-                "  DOWN: {} shares @ ${:.4} avg",
-                summary.down_shares, summary.down_avg_price
-            ));
-        }
-
-        // Show arbitrage info if we have both sides
-        if let Some(avg_cost) = summary.avg_cost_per_pair {
-            let profit_margin = Decimal::ONE - avg_cost;
-            let profit_pct = (profit_margin / avg_cost) * Decimal::ONE_HUNDRED;
-            let status = if avg_cost < Decimal::ONE {
-                format!("PROFITABLE ({:.2}%)", profit_pct)
-            } else {
-                "LOSS".to_string()
-            };
-            self.log(&format!("  Avg cost/pair: ${:.4} - {}", avg_cost, status));
-        }
-    }
-
-    async fn show_history(&mut self) {
-        if !self.config.paper_trading.enabled {
-            self.log("Paper trading is disabled");
-            return;
-        }
-
-        let history = self.paper_trader.get_settled_rounds().await;
-
-        if history.is_empty() {
-            self.log("No settled rounds yet");
-            return;
-        }
-
-        self.log("Settled Rounds History:");
-        for round in history.iter().rev().take(10) {
-            let pnl_str = if round.net_pnl >= Decimal::ZERO {
-                format!("+${:.2}", round.net_pnl)
-            } else {
-                format!("-${:.2}", round.net_pnl.abs())
-            };
-
-            // Extract just the timestamp part from slug
-            let short_slug = round.round_slug.split('-').last().unwrap_or(&round.round_slug);
-
-            self.log(&format!(
-                "  {} | {} won | Cost ${:.2} -> Payout ${:.2} | {}",
-                short_slug,
-                round.winning_side,
-                round.total_cost,
-                round.total_payout,
-                pnl_str
-            ));
-        }
     }
 
     async fn show_order_book(&mut self) {
@@ -1078,16 +979,8 @@ impl App {
         self.cached_seconds_remaining
     }
 
-    pub fn recorder_snapshots(&self) -> u64 {
-        self.recorder.snapshots_written()
-    }
-
     pub fn is_paper_trading(&self) -> bool {
         self.config.paper_trading.enabled && self.paper_mode
-    }
-
-    pub fn is_live_trading(&self) -> bool {
-        !self.paper_mode && self.watcher.client().is_authenticated()
     }
 
     /// Get current trading balance (paper or live)

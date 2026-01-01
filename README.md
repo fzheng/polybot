@@ -72,9 +72,6 @@ Strategy detects a 17% dump in DOWN over 3 seconds
 # Normal mode (paper trading enabled by default - safe!)
 cargo run --release
 
-# Record-only mode (no trading, just collect data)
-cargo run --release -- --record-only
-
 # Verbose logging to file (for debugging)
 cargo run --release -- --verbose --log-file polybot.log
 ```
@@ -86,23 +83,18 @@ Once the bot is running, use these commands:
 | Command | Description |
 |---------|-------------|
 | `help` | Show all commands |
-| `status` | Show current market and prices |
 | `buy up <usd>` | Buy UP shares for USD amount |
 | `buy down <usd>` | Buy DOWN shares for USD amount |
 | `buyshares up <n>` | Buy N UP shares at best ask |
 | `buyshares down <n>` | Buy N DOWN shares at best ask |
-| `params` | Show current strategy parameters |
-| `params <shares> [sum] [move] [window]` | Update strategy parameters |
-| `mode` | Show current trading mode |
+| `params` | Show/update strategy parameters |
 | `mode paper` | Switch to paper trading |
 | `mode live` | Switch to live trading (requires confirmation) |
-| `logs` | Show strategy execution logs |
-| `balance` (or `bal`) | Show paper trading balance |
-| `positions` (or `pos`) | Show open positions |
-| `pnl` | Show profit/loss summary |
+| `book` | Show order book details |
+| `balance` | Show detailed balance info |
+| `positions` | Show all positions by token |
 | `trades` | Show recent trades |
 | `reset` | Reset paper trading balance/history |
-| `clear` | Clear message log |
 | `quit` | Exit the bot |
 
 ### Strategy Parameters
@@ -110,25 +102,28 @@ Once the bot is running, use these commands:
 Adjust the strategy parameters at runtime:
 
 ```
-params <shares> [sum=0.95] [move=0.15] [window=2]
+params <shares> [sum=0.95] [move=0.15] [window=2] [cycles=1]
 ```
 
 - **shares**: Number of shares to buy for each leg
 - **sum**: Hedge threshold (default 0.95 = 5% minimum profit)
 - **move**: Dump threshold percentage (default 0.15 = 15%)
 - **window**: Minutes from round start to watch for Leg 1 (default 2)
+- **cycles**: Maximum cycles per round (default 1)
+
+**Theta Decay**: The sum target uses options-like time decay. It stays strict (at your configured value) for most of the round, then decays exponentially toward 0.99 in the last 5 minutes. This mirrors how options lose time value as expiration approaches, making it easier to complete a hedge as time runs out while maintaining profit margins early in the round.
 
 ### Examples
 
 ```bash
-# Conservative: 10 shares, 5% profit target, 15% dump, 2 min window
-params 10 0.95 0.15 2
+# Conservative: 10 shares, 5% profit target, 15% dump, 2 min window, 1 cycle
+params 10 0.95 0.15 2 1
 
-# Aggressive: 20 shares, 8% profit target, 10% dump, 4 min window
-params 20 0.92 0.10 4
+# Aggressive: 20 shares, 8% profit target, 10% dump, 4 min window, 2 cycles
+params 20 0.92 0.10 4 2
 
-# Very conservative: 5 shares, 3% profit target, 20% dump, 1 min window
-params 5 0.97 0.20 1
+# Very conservative: 5 shares, 3% profit target, 20% dump, 1 min window, 1 cycle
+params 5 0.97 0.20 1 1
 ```
 
 ### Trading Modes
@@ -156,9 +151,10 @@ gamma_endpoint = "https://gamma-api.polymarket.com"
 
 [trading]
 default_shares = 10
-default_sum_target = 0.95
-default_move_pct = 0.15
-default_window_min = 2
+default_sum_target = 0.95      # Hedge threshold (theta decay to 0.99 in last 5 min)
+default_move_pct = 0.15        # 15% dump required for Leg 1
+default_window_min = 2         # Watch for dumps in first 2 minutes
+default_max_cycles = 1         # Max Leg1+Leg2 pairs per round
 dump_window_secs = 3
 
 [recording]

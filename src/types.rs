@@ -300,6 +300,12 @@ impl Default for StrategyState {
 /// 5. When condition met, buy `shares` of the opposite side (Leg 2)
 /// 6. Guaranteed profit = `$1 * shares - total_cost`
 ///
+/// # Time Decay
+///
+/// The sum_target uses options-like theta decay in the last 5 minutes:
+/// - First 10 minutes: No decay, uses strict sum_target
+/// - Last 5 minutes: Exponential decay toward 0.99 (1% minimum profit)
+///
 /// # Example
 ///
 /// With default params (shares=10, sum=0.95, move=15%, window=2min):
@@ -314,6 +320,7 @@ pub struct AutoParams {
     /// Sum threshold for hedge condition.
     /// Leg 2 triggers when: `leg1_price + opposite_ask <= sum_target`.
     /// Lower values = higher profit but fewer opportunities.
+    /// In the last 5 minutes, this decays toward 0.99 (theta decay).
     /// Default: 0.95 (5% minimum profit margin)
     pub sum_target: Decimal,
     /// Dump threshold as a decimal percentage.
@@ -325,15 +332,20 @@ pub struct AutoParams {
     /// After this window, the strategy waits for the next round.
     /// Default: 2 minutes
     pub window_min: u32,
+    /// Maximum number of cycles (Leg1+Leg2 pairs) per round.
+    /// Set to 1 for conservative, higher for more aggressive.
+    /// Default: 1
+    pub max_cycles: u32,
 }
 
 impl Default for AutoParams {
     fn default() -> Self {
         Self {
-            shares: Decimal::new(10, 0),     // 10 shares
-            sum_target: Decimal::new(95, 2), // 0.95
-            move_pct: Decimal::new(15, 2),   // 0.15 (15%)
-            window_min: 2,                   // 2 minutes
+            shares: Decimal::new(10, 0),      // 10 shares
+            sum_target: Decimal::new(95, 2),  // 0.95
+            move_pct: Decimal::new(15, 2),    // 0.15 (15%)
+            window_min: 2,                    // 2 minutes
+            max_cycles: 1,                    // 1 cycle per round
         }
     }
 }
