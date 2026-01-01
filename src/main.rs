@@ -23,9 +23,11 @@
 //! - [`recorder`] - Price data recording for backtesting
 //! - [`terminal`] - Terminal UI and command handling
 //! - [`types`] - Core data structures
+//! - [`live`] - Live trading with official Polymarket SDK
 
 mod api;
 mod config;
+mod live;
 mod market;
 mod paper;
 mod recorder;

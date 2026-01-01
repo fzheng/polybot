@@ -131,13 +131,24 @@ params 5 0.97 0.20 1 1
 The bot supports two trading modes:
 
 - **PAPER** (default): Simulates trades without placing real orders. Safe for testing.
-- **LIVE**: Places real orders on Polymarket. Requires confirmation to enable.
+- **LIVE**: Places real orders on Polymarket using the official SDK. Requires confirmation.
 
 Switch modes using:
 ```
 mode paper   # Switch to paper trading (no real orders)
 mode live    # Switch to live trading (requires 'yes' confirmation)
 ```
+
+### Live Trading Details
+
+When in LIVE mode, the bot uses the official `polymarket-client-sdk` for order execution:
+
+- **FOK Orders**: All orders are Fill-or-Kill for immediate execution certainty
+- **EIP-712 Signing**: Orders are cryptographically signed using your private key
+- **Lazy Authentication**: API auth happens on first order, not at startup
+- **Depth Awareness**: Orders are sized to available liquidity to avoid rejections
+
+The bot will show "LiveTrader initialized for wallet: 0x..." at startup if your private key is configured.
 
 ## Configuration
 
@@ -188,6 +199,29 @@ The bot records price snapshots for backtesting:
 - Always test with paper trading first (enabled by default)
 - Paper trading is enabled by default for your safety
 
+## Depth-Aware Trading
+
+The bot implements smart order sizing based on order book depth:
+
+### Leg 1 Sizing
+- Before buying the dump, checks available depth at best ask
+- If depth < desired shares, reduces order size to match available liquidity
+- Accepts smaller profit on fewer shares rather than risking partial fills
+
+### Leg 2 Iterative Hedging
+- If hedge side depth < remaining imbalance, fills what's available
+- Tracks remaining imbalance and retries on subsequent ticks
+- Uses theta-decayed sum target for relaxed hedging near round end
+- Completes cycle only when fully hedged (imbalance = 0)
+
+### UI Depth Display
+The UI shows up to 3 depth levels for each side:
+```
+UP:   $0.4500 x100@0.45 x50@0.46 x25@0.47
+DOWN: $0.5200 x80@0.52 x40@0.53 x20@0.54
+```
+Format: `x<size>@<price>` for each level, or "no depth" if order book is empty.
+
 ## Architecture
 
 ```
@@ -197,18 +231,20 @@ src/
 ├── config.rs        # Configuration management
 ├── api/
 │   ├── client.rs    # REST API client
-│   └── websocket.rs # WebSocket price streaming
+│   └── websocket.rs # WebSocket price streaming (with depth parsing)
 ├── market/
 │   └── watcher.rs   # Market monitoring
 ├── strategy/
-│   └── auto.rs      # Two-leg strategy implementation
+│   └── auto.rs      # Two-leg strategy with depth-aware sizing
 ├── paper/
 │   └── mod.rs       # Paper trading simulation
+├── live/
+│   └── mod.rs       # SDK-based live trading (FOK/GTC orders)
 ├── recorder/
 │   └── mod.rs       # Data recording for backtesting
 └── terminal/
     ├── app.rs       # Application logic
-    └── ui.rs        # Terminal UI rendering
+    └── ui.rs        # Terminal UI with depth display
 ```
 
 ## API Reference

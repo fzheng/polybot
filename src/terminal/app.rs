@@ -17,6 +17,7 @@ use std::time::Duration;
 
 use crate::api::PolymarketClient;
 use crate::config::Config;
+use crate::live::LiveTrader;
 use crate::market::MarketWatcher;
 use crate::paper::{PaperTrader, LivePositionSummary, SettledRound};
 use crate::recorder::Recorder;
@@ -44,6 +45,7 @@ pub struct App {
     auto_trader: AutoTrader,
     recorder: Recorder,
     paper_trader: PaperTrader,
+    live_trader: Option<LiveTrader>,  // SDK-based live trading
     paper_mode: bool,  // true = paper trading, false = live trading
     pending_mode_switch: Option<bool>,  // Pending mode switch awaiting confirmation
 
@@ -64,6 +66,8 @@ pub struct App {
     // Order book info for UI
     cached_up_ask_size: Option<Decimal>,
     cached_down_ask_size: Option<Decimal>,
+    cached_up_ask_levels: Vec<crate::types::OrderBookLevel>,
+    cached_down_ask_levels: Vec<crate::types::OrderBookLevel>,
 
     // Cached state for UI (paper trading)
     cached_balance: Decimal,
@@ -116,12 +120,32 @@ impl App {
         let paper_mode = config.paper_trading.enabled;
         let client = PolymarketClient::new(&config);
 
+        // Initialize LiveTrader if private key is available (for SDK-based live trading)
+        let live_trader = if let Some(ref private_key) = config.api.private_key {
+            match LiveTrader::new(private_key).await {
+                Ok(lt) => {
+                    messages.push(format!(
+                        "LiveTrader initialized for wallet: {}",
+                        lt.wallet_address().unwrap_or_else(|_| "unknown".to_string())
+                    ));
+                    Some(lt)
+                }
+                Err(e) => {
+                    messages.push(format!("Warning: Failed to init LiveTrader: {}", e));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         Ok(Self {
             client,
             watcher: MarketWatcher::new(config.clone()),
             auto_trader: AutoTrader::new(auto_params),
             recorder,
             paper_trader,
+            live_trader,
             paper_mode,
             pending_mode_switch: None,
             input: String::new(),
@@ -132,6 +156,8 @@ impl App {
             previous_market: None,
             cached_up_ask_size: None,
             cached_down_ask_size: None,
+            cached_up_ask_levels: Vec::new(),
+            cached_down_ask_levels: Vec::new(),
             cached_balance: starting_balance,
             cached_pnl: Decimal::ZERO,
             cached_market_slug: None,
@@ -300,12 +326,14 @@ impl App {
             prev.final_down_price = self.last_down_price;
         }
 
-        // Update order book sizes for UI
+        // Update order book sizes and depth levels for UI
         if let Some(book) = self.watcher.get_up_book().await {
             self.cached_up_ask_size = book.ask_size;
+            self.cached_up_ask_levels = book.ask_levels.clone();
         }
         if let Some(book) = self.watcher.get_down_book().await {
             self.cached_down_ask_size = book.ask_size;
+            self.cached_down_ask_levels = book.ask_levels.clone();
         }
 
         // Update paper trader with current prices
@@ -367,7 +395,12 @@ impl App {
         } else {
             None
         };
-        if let Err(e) = self.auto_trader.tick(&self.watcher, paper_trader).await {
+        let live_trader = if !self.paper_mode {
+            self.live_trader.as_ref()
+        } else {
+            None
+        };
+        if let Err(e) = self.auto_trader.tick(&self.watcher, paper_trader, live_trader).await {
             self.log(&format!("Strategy error: {}", e));
         }
 
@@ -739,9 +772,9 @@ impl App {
                 if !self.paper_mode {
                     self.log("Already in LIVE trading mode");
                 } else {
-                    // Require confirmation for live trading
-                    if !self.watcher.client().is_authenticated() {
-                        self.log("Cannot switch to LIVE mode - not authenticated");
+                    // Require LiveTrader for SDK-based live trading
+                    if self.live_trader.is_none() {
+                        self.log("Cannot switch to LIVE mode - LiveTrader not initialized");
                         self.log("Configure private key in config or POLYMARKET_PRIVATE_KEY env var");
                         return;
                     }
@@ -1004,12 +1037,24 @@ impl App {
         }
     }
 
+    #[allow(dead_code)]
     pub fn up_ask_size(&self) -> Option<Decimal> {
         self.cached_up_ask_size
     }
 
+    #[allow(dead_code)]
     pub fn down_ask_size(&self) -> Option<Decimal> {
         self.cached_down_ask_size
+    }
+
+    /// Get cached UP ask depth levels (up to 3)
+    pub fn up_ask_levels(&self) -> &[crate::types::OrderBookLevel] {
+        &self.cached_up_ask_levels
+    }
+
+    /// Get cached DOWN ask depth levels (up to 3)
+    pub fn down_ask_levels(&self) -> &[crate::types::OrderBookLevel] {
+        &self.cached_down_ask_levels
     }
 
     pub fn live_position(&self) -> &LivePositionSummary {

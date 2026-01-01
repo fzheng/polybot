@@ -190,10 +190,21 @@ impl MarketInfo {
     }
 }
 
+/// A single price level in the order book.
+///
+/// Represents one row in the book with price and available size.
+#[derive(Debug, Clone)]
+pub struct OrderBookLevel {
+    /// Price at this level
+    pub price: Decimal,
+    /// Size available at this price
+    pub size: Decimal,
+}
+
 /// Current state of the order book for a token.
 ///
-/// Tracks the best bid/ask prices and sizes, updated in real-time
-/// via WebSocket connection.
+/// Tracks multiple bid/ask levels (up to 3 levels for depth display),
+/// updated in real-time via WebSocket connection.
 #[derive(Debug, Clone, Default)]
 pub struct OrderBook {
     /// Best (highest) bid price - what buyers are willing to pay
@@ -204,6 +215,10 @@ pub struct OrderBook {
     pub bid_size: Option<Decimal>,
     /// Size available at best ask
     pub ask_size: Option<Decimal>,
+    /// Top ask levels (best ask first, up to 3 levels)
+    pub ask_levels: Vec<OrderBookLevel>,
+    /// Top bid levels (best bid first, up to 3 levels)
+    pub bid_levels: Vec<OrderBookLevel>,
 }
 
 /// Result of a trade execution.
@@ -362,4 +377,354 @@ pub struct PriceEntry {
     pub up_ask: Decimal,
     /// Best ask price for DOWN at this time
     pub down_ask: Decimal,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Duration;
+
+    // ============================================================================
+    // Side Tests
+    // ============================================================================
+
+    #[test]
+    fn test_side_opposite() {
+        assert_eq!(Side::Up.opposite(), Side::Down);
+        assert_eq!(Side::Down.opposite(), Side::Up);
+    }
+
+    #[test]
+    fn test_side_opposite_is_reflexive() {
+        assert_eq!(Side::Up.opposite().opposite(), Side::Up);
+        assert_eq!(Side::Down.opposite().opposite(), Side::Down);
+    }
+
+    #[test]
+    fn test_side_as_str() {
+        assert_eq!(Side::Up.as_str(), "UP");
+        assert_eq!(Side::Down.as_str(), "DOWN");
+    }
+
+    #[test]
+    fn test_side_display() {
+        assert_eq!(format!("{}", Side::Up), "UP");
+        assert_eq!(format!("{}", Side::Down), "DOWN");
+    }
+
+    #[test]
+    fn test_side_equality() {
+        assert_eq!(Side::Up, Side::Up);
+        assert_eq!(Side::Down, Side::Down);
+        assert_ne!(Side::Up, Side::Down);
+    }
+
+    // ============================================================================
+    // OrderType Tests
+    // ============================================================================
+
+    #[test]
+    fn test_order_type_default() {
+        assert_eq!(OrderType::default(), OrderType::Gtc);
+    }
+
+    #[test]
+    fn test_order_type_variants() {
+        let gtc = OrderType::Gtc;
+        let fok = OrderType::Fok;
+        let ioc = OrderType::Ioc;
+
+        assert_ne!(gtc, fok);
+        assert_ne!(fok, ioc);
+        assert_ne!(gtc, ioc);
+    }
+
+    // ============================================================================
+    // MarketInfo Tests
+    // ============================================================================
+
+    fn create_test_market(start_offset_secs: i64, end_offset_secs: i64) -> MarketInfo {
+        let now = Utc::now();
+        MarketInfo {
+            condition_id: "test-condition".to_string(),
+            question_id: "test-question".to_string(),
+            slug: "btc-updown-15m-test".to_string(),
+            up_token_id: "up-token-123".to_string(),
+            down_token_id: "down-token-456".to_string(),
+            start_time: now + Duration::seconds(start_offset_secs),
+            end_time: now + Duration::seconds(end_offset_secs),
+        }
+    }
+
+    #[test]
+    fn test_market_info_seconds_remaining_future() {
+        let market = create_test_market(-60, 300); // started 1 min ago, ends in 5 min
+        let remaining = market.seconds_remaining();
+        // Should be approximately 300 seconds (allowing for test execution time)
+        assert!(remaining > 295 && remaining <= 300);
+    }
+
+    #[test]
+    fn test_market_info_seconds_remaining_past() {
+        let market = create_test_market(-600, -60); // ended 1 min ago
+        let remaining = market.seconds_remaining();
+        assert_eq!(remaining, 0);
+    }
+
+    #[test]
+    fn test_market_info_is_active_true() {
+        let market = create_test_market(-60, 300); // started 1 min ago, ends in 5 min
+        assert!(market.is_active());
+    }
+
+    #[test]
+    fn test_market_info_is_active_not_started() {
+        let market = create_test_market(60, 360); // starts in 1 min
+        assert!(!market.is_active());
+    }
+
+    #[test]
+    fn test_market_info_is_active_ended() {
+        let market = create_test_market(-600, -60); // ended 1 min ago
+        assert!(!market.is_active());
+    }
+
+    // ============================================================================
+    // OrderBook Tests
+    // ============================================================================
+
+    #[test]
+    fn test_order_book_default() {
+        let book = OrderBook::default();
+        assert!(book.best_bid.is_none());
+        assert!(book.best_ask.is_none());
+        assert!(book.bid_size.is_none());
+        assert!(book.ask_size.is_none());
+    }
+
+    #[test]
+    fn test_order_book_with_values() {
+        let book = OrderBook {
+            best_bid: Some(Decimal::new(45, 2)),  // 0.45
+            best_ask: Some(Decimal::new(50, 2)),  // 0.50
+            bid_size: Some(Decimal::new(100, 0)), // 100 shares
+            ask_size: Some(Decimal::new(150, 0)), // 150 shares
+            ask_levels: vec![
+                OrderBookLevel { price: Decimal::new(50, 2), size: Decimal::new(150, 0) },
+            ],
+            bid_levels: vec![
+                OrderBookLevel { price: Decimal::new(45, 2), size: Decimal::new(100, 0) },
+            ],
+        };
+
+        assert_eq!(book.best_bid, Some(Decimal::new(45, 2)));
+        assert_eq!(book.best_ask, Some(Decimal::new(50, 2)));
+        assert_eq!(book.ask_levels.len(), 1);
+        assert_eq!(book.bid_levels.len(), 1);
+    }
+
+    // ============================================================================
+    // StrategyState Tests
+    // ============================================================================
+
+    #[test]
+    fn test_strategy_state_default() {
+        assert_eq!(StrategyState::default(), StrategyState::Watching);
+    }
+
+    #[test]
+    fn test_strategy_state_waiting_for_hedge() {
+        let state = StrategyState::WaitingForHedge {
+            leg1_side: Side::Up,
+            leg1_price: Decimal::new(40, 2), // 0.40
+        };
+
+        if let StrategyState::WaitingForHedge { leg1_side, leg1_price } = state {
+            assert_eq!(leg1_side, Side::Up);
+            assert_eq!(leg1_price, Decimal::new(40, 2));
+        } else {
+            panic!("Expected WaitingForHedge state");
+        }
+    }
+
+    #[test]
+    fn test_strategy_state_equality() {
+        assert_eq!(StrategyState::Watching, StrategyState::Watching);
+        assert_eq!(StrategyState::Completed, StrategyState::Completed);
+
+        let state1 = StrategyState::WaitingForHedge {
+            leg1_side: Side::Up,
+            leg1_price: Decimal::new(40, 2),
+        };
+        let state2 = StrategyState::WaitingForHedge {
+            leg1_side: Side::Up,
+            leg1_price: Decimal::new(40, 2),
+        };
+        let state3 = StrategyState::WaitingForHedge {
+            leg1_side: Side::Down,
+            leg1_price: Decimal::new(40, 2),
+        };
+
+        assert_eq!(state1, state2);
+        assert_ne!(state1, state3);
+    }
+
+    // ============================================================================
+    // AutoParams Tests
+    // ============================================================================
+
+    #[test]
+    fn test_auto_params_default() {
+        let params = AutoParams::default();
+
+        assert_eq!(params.shares, Decimal::new(10, 0));
+        assert_eq!(params.sum_target, Decimal::new(95, 2));
+        assert_eq!(params.move_pct, Decimal::new(15, 2));
+        assert_eq!(params.window_min, 2);
+        assert_eq!(params.max_cycles, 1);
+    }
+
+    #[test]
+    fn test_auto_params_custom() {
+        let params = AutoParams {
+            shares: Decimal::new(20, 0),       // 20 shares
+            sum_target: Decimal::new(92, 2),   // 0.92
+            move_pct: Decimal::new(10, 2),     // 0.10 (10%)
+            window_min: 4,                     // 4 minutes
+            max_cycles: 3,                     // 3 cycles
+        };
+
+        assert_eq!(params.shares, Decimal::new(20, 0));
+        assert_eq!(params.sum_target, Decimal::new(92, 2));
+        assert_eq!(params.move_pct, Decimal::new(10, 2));
+        assert_eq!(params.window_min, 4);
+        assert_eq!(params.max_cycles, 3);
+    }
+
+    #[test]
+    fn test_auto_params_profit_calculation() {
+        // Verify the profit calculation logic described in docs
+        let params = AutoParams::default();
+
+        // Scenario: DOWN drops to 0.35, UP falls to 0.56
+        let leg1_price = Decimal::new(35, 2); // 0.35
+        let leg2_price = Decimal::new(56, 2); // 0.56
+        let sum = leg1_price + leg2_price;    // 0.91
+
+        // Should be within sum_target
+        assert!(sum <= params.sum_target); // 0.91 <= 0.95
+
+        // Calculate profit
+        let total_cost = (leg1_price + leg2_price) * params.shares; // $9.10
+        let payout = params.shares; // $10.00 (one side always wins)
+        let profit = payout - total_cost; // $0.90
+
+        assert_eq!(total_cost, Decimal::new(910, 2));
+        assert_eq!(profit, Decimal::new(90, 2));
+    }
+
+    // ============================================================================
+    // TradeResult & TradeStatus Tests
+    // ============================================================================
+
+    #[test]
+    fn test_trade_status_variants() {
+        assert_ne!(TradeStatus::Pending, TradeStatus::Filled);
+        assert_ne!(TradeStatus::PartiallyFilled, TradeStatus::Cancelled);
+        assert_ne!(TradeStatus::Filled, TradeStatus::Failed);
+    }
+
+    #[test]
+    fn test_trade_result() {
+        let result = TradeResult {
+            order_id: "order-123".to_string(),
+            token_id: "token-456".to_string(),
+            side: BuySell::Buy,
+            price: Decimal::new(50, 2),
+            size: Decimal::new(10, 0),
+            filled_size: Decimal::new(10, 0),
+            status: TradeStatus::Filled,
+            timestamp: Utc::now(),
+        };
+
+        assert_eq!(result.order_id, "order-123");
+        assert_eq!(result.side, BuySell::Buy);
+        assert_eq!(result.size, result.filled_size); // Fully filled
+        assert_eq!(result.status, TradeStatus::Filled);
+    }
+
+    #[test]
+    fn test_trade_result_partial_fill() {
+        let result = TradeResult {
+            order_id: "order-789".to_string(),
+            token_id: "token-abc".to_string(),
+            side: BuySell::Buy,
+            price: Decimal::new(45, 2),
+            size: Decimal::new(100, 0),
+            filled_size: Decimal::new(50, 0), // Only half filled
+            status: TradeStatus::PartiallyFilled,
+            timestamp: Utc::now(),
+        };
+
+        assert!(result.filled_size < result.size);
+        assert_eq!(result.status, TradeStatus::PartiallyFilled);
+    }
+
+    // ============================================================================
+    // PriceEntry Tests
+    // ============================================================================
+
+    #[test]
+    fn test_price_entry() {
+        let entry = PriceEntry {
+            timestamp: Utc::now(),
+            up_ask: Decimal::new(52, 2),   // 0.52
+            down_ask: Decimal::new(48, 2), // 0.48
+        };
+
+        // Sum should be 1.00 (perfectly balanced market)
+        assert_eq!(entry.up_ask + entry.down_ask, Decimal::ONE);
+    }
+
+    #[test]
+    fn test_price_entry_arbitrage_opportunity() {
+        let entry = PriceEntry {
+            timestamp: Utc::now(),
+            up_ask: Decimal::new(45, 2),   // 0.45
+            down_ask: Decimal::new(50, 2), // 0.50
+        };
+
+        let sum = entry.up_ask + entry.down_ask;
+        // Sum < 1.00 means arbitrage opportunity exists
+        assert!(sum < Decimal::ONE);
+        assert_eq!(sum, Decimal::new(95, 2)); // 0.95
+    }
+
+    // ============================================================================
+    // PriceSnapshot Tests
+    // ============================================================================
+
+    #[test]
+    fn test_price_snapshot() {
+        let snapshot = PriceSnapshot {
+            timestamp: Utc::now(),
+            round_slug: "btc-updown-15m-1234567890".to_string(),
+            seconds_remaining: 450,
+            up_token_id: "up-token".to_string(),
+            down_token_id: "down-token".to_string(),
+            up_best_ask: Decimal::new(55, 2),
+            up_best_bid: Decimal::new(53, 2),
+            down_best_ask: Decimal::new(46, 2),
+            down_best_bid: Decimal::new(44, 2),
+        };
+
+        // Verify spread exists (ask > bid)
+        assert!(snapshot.up_best_ask > snapshot.up_best_bid);
+        assert!(snapshot.down_best_ask > snapshot.down_best_bid);
+
+        // Verify reasonable market (UP + DOWN close to 1)
+        let mid_sum = (snapshot.up_best_ask + snapshot.up_best_bid) / Decimal::new(2, 0)
+            + (snapshot.down_best_ask + snapshot.down_best_bid) / Decimal::new(2, 0);
+        assert!(mid_sum < Decimal::new(105, 2)); // Should be close to 1.00
+    }
 }

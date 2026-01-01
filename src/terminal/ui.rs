@@ -76,8 +76,6 @@ fn draw_middle_row(f: &mut Frame, app: &App, area: Rect) {
 fn draw_prices(f: &mut Frame, app: &App, area: Rect) {
     let up_price = app.up_price().unwrap_or(Decimal::ZERO);
     let down_price = app.down_price().unwrap_or(Decimal::ZERO);
-    let up_size = app.up_ask_size();
-    let down_size = app.down_ask_size();
     let sum = up_price + down_price;
 
     let up_color = if up_price > Decimal::ZERO { Color::Green } else { Color::DarkGray };
@@ -88,9 +86,12 @@ fn draw_prices(f: &mut Frame, app: &App, area: Rect) {
         Color::DarkGray
     };
 
-    // Format sizes if available
-    let up_size_str = up_size.map(|s| format!(" x{:.0}", s)).unwrap_or_default();
-    let down_size_str = down_size.map(|s| format!(" x{:.0}", s)).unwrap_or_default();
+    // Format depth levels (up to 3 levels shown inline)
+    let up_levels = app.up_ask_levels();
+    let down_levels = app.down_ask_levels();
+
+    let up_depth_str = format_depth_levels(up_levels);
+    let down_depth_str = format_depth_levels(down_levels);
 
     let text = vec![
         Line::from(vec![
@@ -100,7 +101,7 @@ fn draw_prices(f: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(up_color).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                up_size_str,
+                format!(" {}", up_depth_str),
                 Style::default().fg(Color::DarkGray),
             ),
         ]),
@@ -111,7 +112,7 @@ fn draw_prices(f: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(down_color).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                down_size_str,
+                format!(" {}", down_depth_str),
                 Style::default().fg(Color::DarkGray),
             ),
         ]),
@@ -132,6 +133,20 @@ fn draw_prices(f: &mut Frame, app: &App, area: Rect) {
 
     let paragraph = Paragraph::new(text).block(block);
     f.render_widget(paragraph, area);
+}
+
+/// Format depth levels for display (up to 3 levels)
+/// Returns format like: "x10@.45 x20@.46 x15@.47" or "no depth" if empty
+fn format_depth_levels(levels: &[crate::types::OrderBookLevel]) -> String {
+    if levels.is_empty() {
+        return "no depth".to_string();
+    }
+
+    levels.iter()
+        .take(3)
+        .map(|level| format!("x{:.0}@{:.2}", level.size, level.price))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn draw_status(f: &mut Frame, app: &App, area: Rect) {

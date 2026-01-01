@@ -12,7 +12,7 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
-use crate::types::{OrderBook, PriceEntry};
+use crate::types::{OrderBook, OrderBookLevel, PriceEntry};
 
 /// Price update from WebSocket
 #[derive(Debug, Clone)]
@@ -284,39 +284,70 @@ impl PriceStream {
                                     let mut best_ask = None;
                                     let mut bid_size = None;
                                     let mut ask_size = None;
+                                    let mut ask_levels: Vec<OrderBookLevel> = Vec::new();
+                                    let mut bid_levels: Vec<OrderBookLevel> = Vec::new();
 
-                                    // Find best (highest) bid
+                                    // Parse all bids, sort by price desc, take top 3
                                     if let Some(bids) = &ws_msg.bids {
-                                        if let Some(top) = bids.iter()
-                                            .filter_map(|b| b.price.parse::<Decimal>().ok().map(|p| (p, &b.size)))
-                                            .max_by_key(|(p, _)| *p) {
+                                        let mut parsed_bids: Vec<(Decimal, Decimal)> = bids.iter()
+                                            .filter_map(|b| {
+                                                let price = b.price.parse::<Decimal>().ok()?;
+                                                let size = b.size.parse::<Decimal>().ok()?;
+                                                Some((price, size))
+                                            })
+                                            .collect();
+                                        // Sort by price descending (best bid = highest)
+                                        parsed_bids.sort_by(|a, b| b.0.cmp(&a.0));
+
+                                        // Take top 3 levels
+                                        for (price, size) in parsed_bids.iter().take(3) {
+                                            bid_levels.push(OrderBookLevel { price: *price, size: *size });
+                                        }
+
+                                        // Best bid is first
+                                        if let Some(top) = parsed_bids.first() {
                                             best_bid = Some(top.0);
-                                            bid_size = top.1.parse().ok();
+                                            bid_size = Some(top.1);
                                         }
                                     }
 
-                                    // Find best (lowest) ask
+                                    // Parse all asks, sort by price asc, take top 3
                                     if let Some(asks) = &ws_msg.asks {
-                                        if let Some(top) = asks.iter()
-                                            .filter_map(|a| a.price.parse::<Decimal>().ok().map(|p| (p, &a.size)))
-                                            .min_by_key(|(p, _)| *p) {
+                                        let mut parsed_asks: Vec<(Decimal, Decimal)> = asks.iter()
+                                            .filter_map(|a| {
+                                                let price = a.price.parse::<Decimal>().ok()?;
+                                                let size = a.size.parse::<Decimal>().ok()?;
+                                                Some((price, size))
+                                            })
+                                            .collect();
+                                        // Sort by price ascending (best ask = lowest)
+                                        parsed_asks.sort_by(|a, b| a.0.cmp(&b.0));
+
+                                        // Take top 3 levels
+                                        for (price, size) in parsed_asks.iter().take(3) {
+                                            ask_levels.push(OrderBookLevel { price: *price, size: *size });
+                                        }
+
+                                        // Best ask is first
+                                        if let Some(top) = parsed_asks.first() {
                                             best_ask = Some(top.0);
-                                            ask_size = top.1.parse().ok();
+                                            ask_size = Some(top.1);
                                         }
                                     }
 
                                     if best_bid.is_some() || best_ask.is_some() {
-                                        tracing::info!("Book update for {}: bid={:?}, ask={:?}",
-                                            &asset_id[..8], best_bid, best_ask);
+                                        tracing::info!("Book update for {}: bid={:?}, ask={:?}, ask_levels={}",
+                                            &asset_id[..8], best_bid, best_ask, ask_levels.len());
                                         Self::update_book(
                                             &order_books, &update_tx, asset_id,
-                                            best_bid, best_ask, bid_size, ask_size
+                                            best_bid, best_ask, bid_size, ask_size,
+                                            ask_levels, bid_levels
                                         ).await;
                                     }
                                 }
                             }
                             "price_change" => {
-                                // Price change with best bid/ask
+                                // Price change with best bid/ask (no depth levels)
                                 if let Some(changes) = &ws_msg.price_changes {
                                     for change in changes {
                                         let best_bid = change.best_bid.as_ref()
@@ -326,13 +357,14 @@ impl PriceStream {
 
                                         Self::update_book(
                                             &order_books, &update_tx, &change.asset_id,
-                                            best_bid, best_ask, None, None
+                                            best_bid, best_ask, None, None,
+                                            Vec::new(), Vec::new()
                                         ).await;
                                     }
                                 }
                             }
                             "best_bid_ask" => {
-                                // Direct best bid/ask update
+                                // Direct best bid/ask update (no depth levels)
                                 if let Some(asset_id) = &ws_msg.asset_id {
                                     let best_bid = ws_msg.best_bid.as_ref()
                                         .and_then(|s| s.parse().ok());
@@ -341,7 +373,8 @@ impl PriceStream {
 
                                     Self::update_book(
                                         &order_books, &update_tx, asset_id,
-                                        best_bid, best_ask, None, None
+                                        best_bid, best_ask, None, None,
+                                        Vec::new(), Vec::new()
                                     ).await;
                                 }
                             }
@@ -410,6 +443,8 @@ impl PriceStream {
         best_ask: Option<Decimal>,
         bid_size: Option<Decimal>,
         ask_size: Option<Decimal>,
+        ask_levels: Vec<OrderBookLevel>,
+        bid_levels: Vec<OrderBookLevel>,
     ) {
         // Update order book
         let (final_bid_size, final_ask_size) = {
@@ -430,6 +465,14 @@ impl PriceStream {
                 if ask_size.is_some() {
                     book.ask_size = ask_size;
                 }
+            }
+
+            // Update depth levels (only if provided - book events have full depth)
+            if !ask_levels.is_empty() {
+                book.ask_levels = ask_levels;
+            }
+            if !bid_levels.is_empty() {
+                book.bid_levels = bid_levels;
             }
 
             (book.bid_size, book.ask_size)
