@@ -184,6 +184,7 @@ impl MarketInfo {
     ///
     /// A market is active if the current time is between start and end.
     #[inline]
+    #[allow(dead_code)]
     pub fn is_active(&self) -> bool {
         let now = Utc::now();
         now >= self.start_time && now < self.end_time

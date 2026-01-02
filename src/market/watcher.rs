@@ -58,11 +58,14 @@ impl MarketWatcher {
 
     /// Refresh the current market (find new round if needed)
     pub async fn refresh_market(&mut self) -> Result<bool> {
-        // Check if current market is still active
+        // Check if current market is still valid (active OR hasn't started yet but not ended)
+        // This allows us to switch to the next market early and stay on it
         {
             let market = self.current_market.read().await;
             if let Some(m) = market.as_ref() {
-                if m.is_active() {
+                let now = Utc::now();
+                // Keep current market if it hasn't ended yet (even if it hasn't started)
+                if now < m.end_time {
                     return Ok(false); // No change needed
                 }
             }
