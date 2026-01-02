@@ -210,6 +210,55 @@ impl MarketWatcher {
         }
     }
 
+    /// Get the next market (the one that starts when current ends)
+    /// Used for early switching after hedge completion
+    pub async fn get_next_market(&self) -> Option<MarketInfo> {
+        match self.client.get_next_btc_market().await {
+            Ok(market) => market,
+            Err(e) => {
+                tracing::warn!("Failed to fetch next market: {}", e);
+                None
+            }
+        }
+    }
+
+    /// Switch to the next market immediately (for early entry after hedge completion)
+    /// Returns true if successfully switched to next market
+    pub async fn switch_to_next_market(&mut self) -> bool {
+        match self.client.get_next_btc_market().await {
+            Ok(Some(next_market)) => {
+                tracing::info!(
+                    "Switching to next market: {} (starts at {})",
+                    next_market.slug,
+                    next_market.start_time.format("%H:%M:%S")
+                );
+
+                // Update price stream with new tokens
+                let tokens = vec![
+                    next_market.up_token_id.clone(),
+                    next_market.down_token_id.clone(),
+                ];
+                if let Err(e) = self.price_stream.start(tokens).await {
+                    tracing::error!("Failed to start price stream for next market: {}", e);
+                    return false;
+                }
+
+                // Update current market
+                let mut current = self.current_market.write().await;
+                *current = Some(next_market);
+                true
+            }
+            Ok(None) => {
+                tracing::debug!("Next market not yet available");
+                false
+            }
+            Err(e) => {
+                tracing::warn!("Failed to fetch next market: {}", e);
+                false
+            }
+        }
+    }
+
     /// Get the API client for trading
     pub fn client(&self) -> &PolymarketClient {
         &self.client

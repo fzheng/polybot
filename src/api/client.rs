@@ -268,6 +268,65 @@ impl PolymarketClient {
         Ok(None)
     }
 
+    /// Get the next BTC 15-minute UP/DOWN market (the one starting after current round ends)
+    /// This is used for early switching after completing an arbitrage cycle
+    pub async fn get_next_btc_market(&self) -> Result<Option<MarketInfo>> {
+        let now = Utc::now();
+        let current_minute = now.minute();
+
+        // Find the next 15-minute boundary (start time of next round)
+        let minutes_until_boundary = 15 - (current_minute % 15);
+        let next_start_time = now + chrono::Duration::minutes(minutes_until_boundary as i64);
+        // Truncate to exact minute
+        let next_start_time = next_start_time
+            .with_second(0).unwrap()
+            .with_nanosecond(0).unwrap();
+        let next_end_time = next_start_time + chrono::Duration::minutes(15);
+
+        let next_start_timestamp = next_start_time.timestamp();
+        let expected_slug = format!("btc-updown-15m-{}", next_start_timestamp);
+
+        tracing::debug!(
+            "Looking for next market slug: {} (starts at {}, ends at {})",
+            expected_slug,
+            next_start_time.format("%H:%M:%S"),
+            next_end_time.format("%H:%M:%S")
+        );
+
+        // Query directly for this specific market
+        let url = format!(
+            "{}/events?slug={}",
+            self.gamma_endpoint,
+            expected_slug
+        );
+
+        let resp = self.client.get(&url).send().await?;
+
+        if !resp.status().is_success() {
+            tracing::debug!("Next market {} not found yet", expected_slug);
+            return Ok(None);
+        }
+
+        let events: Vec<EventData> = resp.json().await?;
+
+        if let Some(event) = events.into_iter().next() {
+            if let Some(market) = event.markets.into_iter().next() {
+                if let Some(market_info) = self.parse_btc_market(&market) {
+                    tracing::info!(
+                        "Found next market: {} (starts at {}, ends at {})",
+                        market_info.slug,
+                        market_info.start_time.format("%H:%M:%S"),
+                        market_info.end_time.format("%H:%M:%S")
+                    );
+                    return Ok(Some(market_info));
+                }
+            }
+        }
+
+        tracing::debug!("No next BTC 15-minute market found for slug {}", expected_slug);
+        Ok(None)
+    }
+
     /// Search for markets by text query
     pub async fn search_markets(&self, query: &str) -> Result<Vec<MarketInfo>> {
         let url = format!(

@@ -81,6 +81,9 @@ pub struct AutoTrader {
     cycles_completed: Arc<RwLock<u32>>,
     /// Remaining imbalance from partial Leg 2 fills (shares needing hedge)
     leg2_imbalance: Arc<RwLock<Decimal>>,
+    /// Flag indicating the trader wants to switch to the next market
+    /// Set after completing a cycle when there's time remaining for more opportunities
+    wants_next_market: Arc<RwLock<bool>>,
 }
 
 impl AutoTrader {
@@ -98,6 +101,7 @@ impl AutoTrader {
             total_profit: Arc::new(RwLock::new(Decimal::ZERO)),
             cycles_completed: Arc::new(RwLock::new(0)),
             leg2_imbalance: Arc::new(RwLock::new(Decimal::ZERO)),
+            wants_next_market: Arc::new(RwLock::new(false)),
         }
     }
 
@@ -137,6 +141,19 @@ impl AutoTrader {
     /// Get cycles completed
     pub async fn get_cycles_completed(&self) -> u32 {
         *self.cycles_completed.read().await
+    }
+
+    /// Check if the trader wants to switch to the next market
+    /// This is set after completing a cycle when there's time for more opportunities
+    pub async fn wants_next_market(&self) -> bool {
+        *self.wants_next_market.read().await
+    }
+
+    /// Acknowledge that we've switched to the next market
+    /// Called by the app after successfully switching markets
+    pub async fn acknowledge_market_switch(&self) {
+        let mut wants = self.wants_next_market.write().await;
+        *wants = false;
     }
 
     /// Process a tick - called regularly to update strategy
@@ -201,8 +218,20 @@ impl AutoTrader {
                 drop(cycles);
 
                 self.reset_cycle().await;
-                self.log(&format!("Cycle {} complete - {} for next round", current,
-                    if current >= max_cycles { "waiting" } else { "ready" })).await;
+
+                // Check if we've reached max cycles for this round
+                if current >= max_cycles {
+                    // Signal that we want to switch to next market for more opportunities
+                    let mut wants = self.wants_next_market.write().await;
+                    *wants = true;
+                    drop(wants);
+                    self.log(&format!(
+                        "Cycle {} complete - requesting switch to next market",
+                        current
+                    )).await;
+                } else {
+                    self.log(&format!("Cycle {} complete - ready for more", current)).await;
+                }
             }
         }
 

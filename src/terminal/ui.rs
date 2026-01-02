@@ -32,7 +32,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(7),   // Header row (prices + status)
-            Constraint::Length(6),   // Middle row (positions + history)
+            Constraint::Length(10),  // Middle row (positions + history) - increased for multi-market
             Constraint::Min(8),      // Log
             Constraint::Length(3),   // Input
         ])
@@ -212,61 +212,99 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_live_position(f: &mut Frame, app: &App, area: Rect) {
-    let pos = app.live_position();
+    let multi_pos = app.multi_market_positions();
     let mut text = Vec::new();
 
-    let has_position = pos.up_shares > Decimal::ZERO || pos.down_shares > Decimal::ZERO;
+    let has_current = multi_pos.current_market.as_ref()
+        .map(|p| p.up_shares > Decimal::ZERO || p.down_shares > Decimal::ZERO)
+        .unwrap_or(false);
 
-    if has_position {
-        if pos.up_shares > Decimal::ZERO {
-            text.push(Line::from(vec![
-                Span::styled("UP:   ", Style::default().fg(Color::Green)),
-                Span::styled(
-                    format!("{:.0}", pos.up_shares),
-                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    format!(" @ ${:.4}", pos.up_avg_price),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ]));
-        }
-        if pos.down_shares > Decimal::ZERO {
-            text.push(Line::from(vec![
-                Span::styled("DOWN: ", Style::default().fg(Color::Red)),
-                Span::styled(
-                    format!("{:.0}", pos.down_shares),
-                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    format!(" @ ${:.4}", pos.down_avg_price),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ]));
+    let has_next = multi_pos.next_market.as_ref()
+        .map(|p| p.up_shares > Decimal::ZERO || p.down_shares > Decimal::ZERO)
+        .unwrap_or(false);
+
+    if has_current || has_next {
+        // Show current market positions
+        if let Some(pos) = &multi_pos.current_market {
+            if pos.up_shares > Decimal::ZERO || pos.down_shares > Decimal::ZERO {
+                // Extract short slug (timestamp only)
+                let short_slug = pos.round_slug.split('-').last().unwrap_or(&pos.round_slug);
+                text.push(Line::from(Span::styled(
+                    format!("[{}] Current", short_slug),
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                )));
+                add_position_lines(&mut text, pos);
+            }
         }
 
-        // Show arbitrage status if we have both sides
-        if let Some(avg_cost) = pos.avg_cost_per_pair {
-            let profit_margin = Decimal::ONE - avg_cost;
-            let status_color = if avg_cost < Decimal::ONE { Color::Green } else { Color::Red };
-            let status_text = if avg_cost < Decimal::ONE {
-                format!("Avg: ${:.4} (+{:.1}%)", avg_cost, profit_margin * Decimal::ONE_HUNDRED)
-            } else {
-                format!("Avg: ${:.4} (LOSS)", avg_cost)
-            };
-            text.push(Line::from(Span::styled(status_text, Style::default().fg(status_color))));
+        // Show next market positions (if any)
+        if let Some(pos) = &multi_pos.next_market {
+            if pos.up_shares > Decimal::ZERO || pos.down_shares > Decimal::ZERO {
+                // Add separator if we have both
+                if has_current {
+                    text.push(Line::from(""));
+                }
+                let short_slug = pos.round_slug.split('-').last().unwrap_or(&pos.round_slug);
+                text.push(Line::from(Span::styled(
+                    format!("[{}] Next", short_slug),
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                )));
+                add_position_lines(&mut text, pos);
+            }
         }
     } else {
         text.push(Line::from(Span::styled("No position", Style::default().fg(Color::DarkGray))));
     }
 
     let block = Block::default()
-        .title(" Position ")
+        .title(" Positions ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Magenta));
 
     let paragraph = Paragraph::new(text).block(block);
     f.render_widget(paragraph, area);
+}
+
+/// Helper to add position detail lines to text vector
+fn add_position_lines(text: &mut Vec<Line<'_>>, pos: &crate::paper::LivePositionSummary) {
+    if pos.up_shares > Decimal::ZERO {
+        text.push(Line::from(vec![
+            Span::styled(" UP:   ", Style::default().fg(Color::Green)),
+            Span::styled(
+                format!("{:.0}", pos.up_shares),
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" @ ${:.4}", pos.up_avg_price),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+    }
+    if pos.down_shares > Decimal::ZERO {
+        text.push(Line::from(vec![
+            Span::styled(" DOWN: ", Style::default().fg(Color::Red)),
+            Span::styled(
+                format!("{:.0}", pos.down_shares),
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" @ ${:.4}", pos.down_avg_price),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+    }
+
+    // Show arbitrage status if we have both sides
+    if let Some(avg_cost) = pos.avg_cost_per_pair {
+        let profit_margin = Decimal::ONE - avg_cost;
+        let status_color = if avg_cost < Decimal::ONE { Color::Green } else { Color::Red };
+        let status_text = if avg_cost < Decimal::ONE {
+            format!(" Avg: ${:.4} (+{:.1}%)", avg_cost, profit_margin * Decimal::ONE_HUNDRED)
+        } else {
+            format!(" Avg: ${:.4} (LOSS)", avg_cost)
+        };
+        text.push(Line::from(Span::styled(status_text, Style::default().fg(status_color))));
+    }
 }
 
 fn draw_history(f: &mut Frame, app: &App, area: Rect) {

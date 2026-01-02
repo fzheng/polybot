@@ -19,7 +19,7 @@ use crate::api::PolymarketClient;
 use crate::config::Config;
 use crate::live::LiveTrader;
 use crate::market::MarketWatcher;
-use crate::paper::{PaperTrader, LivePositionSummary, SettledRound};
+use crate::paper::{PaperTrader, LivePositionSummary, MultiMarketPositions, SettledRound};
 use crate::recorder::Recorder;
 use crate::strategy::AutoTrader;
 use crate::types::{AutoParams, Side};
@@ -77,6 +77,8 @@ pub struct App {
 
     // Cached positions and history for UI (paper trading)
     cached_live_position: LivePositionSummary,
+    cached_multi_market_positions: MultiMarketPositions,
+    cached_next_market_slug: Option<String>,
     cached_history: Vec<SettledRound>,
 
     // Cached state for live trading (fetched from Polymarket API)
@@ -163,6 +165,8 @@ impl App {
             cached_market_slug: None,
             cached_seconds_remaining: None,
             cached_live_position: LivePositionSummary::default(),
+            cached_multi_market_positions: MultiMarketPositions::default(),
+            cached_next_market_slug: None,
             cached_history: Vec::new(),
             pending_settlements: Vec::new(),
             last_settlement_retry: None,
@@ -402,6 +406,34 @@ impl App {
         };
         if let Err(e) = self.auto_trader.tick(&self.watcher, paper_trader, live_trader).await {
             self.log(&format!("Strategy error: {}", e));
+        }
+
+        // Check if auto trader wants to switch to next market (after completing a cycle)
+        if self.auto_trader.wants_next_market().await {
+            // Try to switch to the next market
+            if self.watcher.switch_to_next_market().await {
+                self.auto_trader.acknowledge_market_switch().await;
+                if let Some(m) = self.watcher.get_current_market().await {
+                    self.log(&format!("Switched to next market: {}", m.slug));
+                    self.cached_market_slug = Some(m.slug.clone());
+                    self.cached_seconds_remaining = Some(m.seconds_remaining());
+                }
+            }
+        }
+
+        // Update next market slug for UI (for displaying upcoming positions)
+        if let Some(next) = self.watcher.get_next_market().await {
+            self.cached_next_market_slug = Some(next.slug);
+        } else {
+            self.cached_next_market_slug = None;
+        }
+
+        // Update multi-market positions for UI
+        if self.config.paper_trading.enabled {
+            self.cached_multi_market_positions = self.paper_trader.get_multi_market_positions(
+                self.cached_market_slug.as_deref(),
+                self.cached_next_market_slug.as_deref(),
+            ).await;
         }
 
         // Forward new strategy logs to UI
@@ -1057,8 +1089,20 @@ impl App {
         &self.cached_down_ask_levels
     }
 
+    #[allow(dead_code)]
     pub fn live_position(&self) -> &LivePositionSummary {
         &self.cached_live_position
+    }
+
+    /// Get multi-market positions (current + upcoming market)
+    pub fn multi_market_positions(&self) -> &MultiMarketPositions {
+        &self.cached_multi_market_positions
+    }
+
+    /// Get the next market slug (if known)
+    #[allow(dead_code)]
+    pub fn next_market_slug(&self) -> Option<&str> {
+        self.cached_next_market_slug.as_deref()
     }
 
     pub fn settled_history(&self) -> &[SettledRound] {

@@ -98,6 +98,15 @@ pub struct LivePositionSummary {
     pub avg_cost_per_pair: Option<Decimal>,
 }
 
+/// Multi-market position summary (for displaying positions across current and upcoming markets)
+#[derive(Debug, Clone, Default)]
+pub struct MultiMarketPositions {
+    /// Position in the current active market (if any)
+    pub current_market: Option<LivePositionSummary>,
+    /// Position in the upcoming/next market (if any, from early Leg 1 entry)
+    pub next_market: Option<LivePositionSummary>,
+}
+
 /// Paper trading engine
 pub struct PaperTrader {
     config: PaperTradingConfig,
@@ -607,6 +616,63 @@ impl PaperTrader {
     pub async fn has_positions_for_round(&self, round_slug: &str) -> bool {
         let positions = self.positions.read().await;
         positions.values().any(|p| p.round_slug == round_slug)
+    }
+
+    /// Get all active position summaries grouped by round
+    /// Returns a map of round_slug -> LivePositionSummary
+    pub async fn get_all_position_summaries(&self) -> std::collections::HashMap<String, LivePositionSummary> {
+        let positions = self.positions.read().await;
+        let mut summaries: std::collections::HashMap<String, LivePositionSummary> = std::collections::HashMap::new();
+
+        for pos in positions.values() {
+            let summary = summaries.entry(pos.round_slug.clone()).or_insert_with(|| {
+                LivePositionSummary {
+                    round_slug: pos.round_slug.clone(),
+                    ..Default::default()
+                }
+            });
+
+            match pos.side {
+                Side::Up => {
+                    summary.up_shares = pos.shares;
+                    summary.up_avg_price = pos.avg_entry_price;
+                }
+                Side::Down => {
+                    summary.down_shares = pos.shares;
+                    summary.down_avg_price = pos.avg_entry_price;
+                }
+            }
+        }
+
+        // Calculate avg_cost_per_pair for each summary
+        for summary in summaries.values_mut() {
+            if summary.up_shares > Decimal::ZERO && summary.down_shares > Decimal::ZERO {
+                let min_shares = summary.up_shares.min(summary.down_shares);
+                if min_shares > Decimal::ZERO {
+                    let paired_cost = (summary.up_avg_price * min_shares)
+                        + (summary.down_avg_price * min_shares);
+                    summary.avg_cost_per_pair = Some(paired_cost / min_shares);
+                }
+            }
+        }
+
+        summaries
+    }
+
+    /// Get multi-market position summary for UI display
+    /// current_slug: The slug of the current active market
+    /// next_slug: The slug of the upcoming market (if known)
+    pub async fn get_multi_market_positions(
+        &self,
+        current_slug: Option<&str>,
+        next_slug: Option<&str>,
+    ) -> MultiMarketPositions {
+        let all_summaries = self.get_all_position_summaries().await;
+
+        MultiMarketPositions {
+            current_market: current_slug.and_then(|slug| all_summaries.get(slug).cloned()),
+            next_market: next_slug.and_then(|slug| all_summaries.get(slug).cloned()),
+        }
     }
 
     /// Mark a cycle as abandoned (round changed before completion)
