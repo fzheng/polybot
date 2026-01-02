@@ -78,7 +78,8 @@ pub struct App {
     // Cached positions and history for UI (paper trading)
     cached_live_position: LivePositionSummary,
     cached_multi_market_positions: MultiMarketPositions,
-    cached_next_market_slug: Option<String>,
+    /// The time-based active market slug (based on wall clock, not trading target)
+    cached_active_market_slug: Option<String>,
     cached_history: Vec<SettledRound>,
 
     // Cached state for live trading (fetched from Polymarket API)
@@ -166,7 +167,7 @@ impl App {
             cached_seconds_remaining: None,
             cached_live_position: LivePositionSummary::default(),
             cached_multi_market_positions: MultiMarketPositions::default(),
-            cached_next_market_slug: None,
+            cached_active_market_slug: None,
             cached_history: Vec::new(),
             pending_settlements: Vec::new(),
             last_settlement_retry: None,
@@ -421,18 +422,23 @@ impl App {
             }
         }
 
-        // Update next market slug for UI (for displaying upcoming positions)
-        if let Some(next) = self.watcher.get_next_market().await {
-            self.cached_next_market_slug = Some(next.slug);
-        } else {
-            self.cached_next_market_slug = None;
+        // Get the time-based active market (based on wall clock, for position labeling)
+        // This is different from cached_market_slug which is the market we're trading on
+        if let Ok(Some(active)) = self.client.get_btc_market().await {
+            let active_slug = active.slug.clone();
+            self.cached_active_market_slug = Some(active_slug.clone());
+
+            // Check for rounds that have ended and need settlement
+            // These are rounds with positions where slug < active_slug (already ended)
+            if self.paper_mode {
+                self.settle_ended_rounds(&active_slug).await;
+            }
         }
 
         // Update multi-market positions for UI
         if self.config.paper_trading.enabled {
             self.cached_multi_market_positions = self.paper_trader.get_multi_market_positions(
-                self.cached_market_slug.as_deref(),
-                self.cached_next_market_slug.as_deref(),
+                self.cached_active_market_slug.as_deref(),
             ).await;
         }
 
@@ -545,6 +551,57 @@ impl App {
         }
 
         self.pending_settlements = still_pending;
+    }
+
+    /// Settle any rounds that have ended based on wall clock time
+    /// This handles the case where we switched to a future market early
+    /// and have positions in past rounds that need settlement
+    async fn settle_ended_rounds(&mut self, active_slug: &str) {
+        // Get all position summaries
+        let summaries = self.paper_trader.get_all_position_summaries().await;
+
+        // Find rounds that have ended (slug < active_slug) and have positions
+        for (slug, summary) in summaries {
+            // Skip if no actual positions
+            if summary.up_shares <= Decimal::ZERO && summary.down_shares <= Decimal::ZERO {
+                continue;
+            }
+
+            // Skip if this is the active or future round
+            if slug.as_str() >= active_slug {
+                continue;
+            }
+
+            // This round has ended and has positions - try to settle
+            self.log(&format!("Settling ended round: {}", slug));
+
+            // We need to get token IDs for this round
+            // Extract them from the slug by querying the API
+            match self.client.get_market_info_by_slug(&slug).await {
+                Ok(Some(market_info)) => {
+                    let prev = PreviousMarket {
+                        slug: slug.clone(),
+                        up_token_id: market_info.up_token_id,
+                        down_token_id: market_info.down_token_id,
+                        final_up_price: None, // Not needed for outcome-based settlement
+                        final_down_price: None,
+                    };
+
+                    if !self.settle_previous_round(prev.clone()).await {
+                        // Add to pending if not yet resolved
+                        if !self.pending_settlements.iter().any(|p| p.slug == slug) {
+                            self.pending_settlements.push(prev);
+                        }
+                    }
+                }
+                Ok(None) => {
+                    self.log(&format!("Could not find market info for {}", slug));
+                }
+                Err(e) => {
+                    self.log(&format!("Error fetching market {}: {}", slug, e));
+                }
+            }
+        }
     }
 
     /// Handle a command input
@@ -1008,7 +1065,8 @@ impl App {
     }
 
     fn log(&mut self, msg: &str) {
-        self.messages.push(msg.to_string());
+        let timestamp = Local::now().format("%H:%M:%S");
+        self.messages.push(format!("[{}] {}", timestamp, msg));
         // Keep only last 100 messages
         if self.messages.len() > 100 {
             self.messages.remove(0);
@@ -1094,15 +1152,9 @@ impl App {
         &self.cached_live_position
     }
 
-    /// Get multi-market positions (current + upcoming market)
+    /// Get multi-market positions (all rounds with positions)
     pub fn multi_market_positions(&self) -> &MultiMarketPositions {
         &self.cached_multi_market_positions
-    }
-
-    /// Get the next market slug (if known)
-    #[allow(dead_code)]
-    pub fn next_market_slug(&self) -> Option<&str> {
-        self.cached_next_market_slug.as_deref()
     }
 
     pub fn settled_history(&self) -> &[SettledRound] {

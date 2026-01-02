@@ -172,8 +172,9 @@ impl MarketWatcher {
     }
 
     /// Detect price dump in the given time window
-    /// Returns (side_that_dumped, dump_percentage) if dump detected
-    pub async fn detect_dump(&self, window_secs: u64, threshold_pct: Decimal) -> Option<(Side, Decimal)> {
+    /// Returns (side_that_dumped, dump_percentage, dumped_price) if dump detected
+    /// The dumped_price is the price at the end of the dump (the low price we want to buy at)
+    pub async fn detect_dump(&self, window_secs: u64, threshold_pct: Decimal) -> Option<(Side, Decimal, Decimal)> {
         let history = self.get_price_history(window_secs).await;
 
         if history.len() < 2 {
@@ -187,7 +188,7 @@ impl MarketWatcher {
         if first.up_ask > Decimal::ZERO {
             let up_change = (first.up_ask - last.up_ask) / first.up_ask;
             if up_change >= threshold_pct {
-                return Some((Side::Up, up_change));
+                return Some((Side::Up, up_change, last.up_ask));
             }
         }
 
@@ -195,7 +196,7 @@ impl MarketWatcher {
         if first.down_ask > Decimal::ZERO {
             let down_change = (first.down_ask - last.down_ask) / first.down_ask;
             if down_change >= threshold_pct {
-                return Some((Side::Down, down_change));
+                return Some((Side::Down, down_change, last.down_ask));
             }
         }
 

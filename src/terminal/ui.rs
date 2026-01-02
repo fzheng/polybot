@@ -215,45 +215,58 @@ fn draw_live_position(f: &mut Frame, app: &App, area: Rect) {
     let multi_pos = app.multi_market_positions();
     let mut text = Vec::new();
 
-    let has_current = multi_pos.current_market.as_ref()
-        .map(|p| p.up_shares > Decimal::ZERO || p.down_shares > Decimal::ZERO)
-        .unwrap_or(false);
-
-    let has_next = multi_pos.next_market.as_ref()
-        .map(|p| p.up_shares > Decimal::ZERO || p.down_shares > Decimal::ZERO)
-        .unwrap_or(false);
-
-    if has_current || has_next {
-        // Show current market positions
-        if let Some(pos) = &multi_pos.current_market {
-            if pos.up_shares > Decimal::ZERO || pos.down_shares > Decimal::ZERO {
-                // Extract short slug (timestamp only)
-                let short_slug = pos.round_slug.split('-').last().unwrap_or(&pos.round_slug);
-                text.push(Line::from(Span::styled(
-                    format!("[{}] Current", short_slug),
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                )));
-                add_position_lines(&mut text, pos);
-            }
-        }
-
-        // Show next market positions (if any)
-        if let Some(pos) = &multi_pos.next_market {
-            if pos.up_shares > Decimal::ZERO || pos.down_shares > Decimal::ZERO {
-                // Add separator if we have both
-                if has_current {
-                    text.push(Line::from(""));
-                }
-                let short_slug = pos.round_slug.split('-').last().unwrap_or(&pos.round_slug);
-                text.push(Line::from(Span::styled(
-                    format!("[{}] Next", short_slug),
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-                )));
-                add_position_lines(&mut text, pos);
-            }
-        }
-    } else {
+    if multi_pos.positions.is_empty() {
         text.push(Line::from(Span::styled("No position", Style::default().fg(Color::DarkGray))));
+    } else {
+        // Get the active market slug for comparison
+        let active_slug = multi_pos.positions.iter()
+            .find(|(_, _, is_active)| *is_active)
+            .map(|(slug, _, _)| slug.as_str());
+
+        let mut first = true;
+        for (slug, pos, is_active) in &multi_pos.positions {
+            // Add separator between positions
+            if !first {
+                text.push(Line::from(""));
+            }
+            first = false;
+
+            // Extract short slug (timestamp only)
+            let short_slug = slug.split('-').last().unwrap_or(slug);
+
+            // Determine label based on position relative to active market
+            let (label, color) = if *is_active {
+                // This is the currently running market (by wall clock time)
+                // Check if it's hedged (has both UP and DOWN)
+                if pos.up_shares > Decimal::ZERO && pos.down_shares > Decimal::ZERO {
+                    ("Active (hedged)", Color::Green)
+                } else {
+                    ("Active", Color::Cyan)
+                }
+            } else if let Some(active) = active_slug {
+                // Compare slugs to determine if this is past or future
+                if slug.as_str() < active {
+                    // Earlier timestamp = previous market (pending settlement)
+                    if pos.up_shares > Decimal::ZERO && pos.down_shares > Decimal::ZERO {
+                        ("Settling (hedged)", Color::Magenta)
+                    } else {
+                        ("Settling", Color::Magenta)
+                    }
+                } else {
+                    // Later timestamp = future market (early entry)
+                    ("Upcoming", Color::Yellow)
+                }
+            } else {
+                // No active market found, just show as pending
+                ("Pending", Color::DarkGray)
+            };
+
+            text.push(Line::from(Span::styled(
+                format!("[{}] {}", short_slug, label),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            )));
+            add_position_lines(&mut text, pos);
+        }
     }
 
     let block = Block::default()

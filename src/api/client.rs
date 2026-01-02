@@ -327,6 +327,33 @@ impl PolymarketClient {
         Ok(None)
     }
 
+    /// Get market info by slug (for settlement of past rounds)
+    pub async fn get_market_info_by_slug(&self, slug: &str) -> Result<Option<MarketInfo>> {
+        let url = format!(
+            "{}/events?slug={}",
+            self.gamma_endpoint,
+            slug
+        );
+
+        let resp = self.client.get(&url).send().await?;
+
+        if !resp.status().is_success() {
+            return Ok(None);
+        }
+
+        let events: Vec<EventData> = resp.json().await?;
+
+        if let Some(event) = events.into_iter().next() {
+            if let Some(market) = event.markets.into_iter().next() {
+                if let Some(market_info) = self.parse_btc_market(&market) {
+                    return Ok(Some(market_info));
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
     /// Search for markets by text query
     pub async fn search_markets(&self, query: &str) -> Result<Vec<MarketInfo>> {
         let url = format!(

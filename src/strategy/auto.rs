@@ -256,15 +256,16 @@ impl AutoTrader {
         let dump = watcher.detect_dump(3, params.move_pct).await; // 3 second window
         drop(params);
 
-        if let Some((side, pct)) = dump {
+        if let Some((side, pct, dumped_price)) = dump {
             self.log(&format!(
-                "Dump detected! {} dropped {}%",
+                "Dump detected! {} dropped {}% to ${:.4}",
                 side,
-                (pct * Decimal::ONE_HUNDRED).round_dp(2)
+                (pct * Decimal::ONE_HUNDRED).round_dp(2),
+                dumped_price
             )).await;
 
-            // Execute Leg 1
-            if let Err(e) = self.execute_leg1(watcher, paper_trader, live_trader, side).await {
+            // Execute Leg 1 with the expected dumped price
+            if let Err(e) = self.execute_leg1(watcher, paper_trader, live_trader, side, dumped_price).await {
                 self.log_error(&format!("Leg 1 failed: {}", e)).await;
             }
         }
@@ -274,12 +275,16 @@ impl AutoTrader {
 
     /// Execute Leg 1 - buy the side that dumped
     /// Implements depth-aware sizing: reduces order to available depth if needed
+    ///
+    /// `expected_price` is the dumped price from detection - we validate the current price
+    /// hasn't bounced too much before executing
     async fn execute_leg1(
         &self,
         watcher: &MarketWatcher,
         paper_trader: Option<&PaperTrader>,
         live_trader: Option<&LiveTrader>,
         side: Side,
+        expected_price: Decimal,
     ) -> Result<()> {
         let market = watcher.get_current_market().await
             .ok_or_else(|| anyhow::anyhow!("No active market"))?;
@@ -290,7 +295,7 @@ impl AutoTrader {
         };
 
         // Get current price and order book
-        let (price, available_depth) = match side {
+        let (current_price, available_depth) = match side {
             Side::Up => {
                 let book = watcher.get_up_book().await;
                 let price = book.as_ref().and_then(|b| b.best_ask);
@@ -305,7 +310,24 @@ impl AutoTrader {
             }
         };
 
-        let price = price.ok_or_else(|| anyhow::anyhow!("No price available"))?;
+        let current_price = current_price.ok_or_else(|| anyhow::anyhow!("No price available"))?;
+
+        // Validate price hasn't bounced too much from the dump price
+        // Allow up to 5% deviation from expected dumped price
+        let max_deviation = Decimal::new(5, 2); // 0.05 = 5%
+        if expected_price > Decimal::ZERO {
+            let deviation = (current_price - expected_price) / expected_price;
+            if deviation > max_deviation {
+                self.log(&format!(
+                    "Price bounced too much! Expected ${:.4}, current ${:.4} (+{:.1}%) - skipping",
+                    expected_price, current_price, deviation * Decimal::ONE_HUNDRED
+                )).await;
+                return Ok(());
+            }
+        }
+
+        // Use the better of expected or current price (should be similar after validation)
+        let price = current_price;
 
         let params = self.params.read().await;
         let desired_shares = params.shares;

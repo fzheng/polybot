@@ -101,10 +101,10 @@ pub struct LivePositionSummary {
 /// Multi-market position summary (for displaying positions across current and upcoming markets)
 #[derive(Debug, Clone, Default)]
 pub struct MultiMarketPositions {
-    /// Position in the current active market (if any)
-    pub current_market: Option<LivePositionSummary>,
-    /// Position in the upcoming/next market (if any, from early Leg 1 entry)
-    pub next_market: Option<LivePositionSummary>,
+    /// All positions grouped by round slug, sorted by timestamp
+    /// Each entry is (round_slug, position_summary, is_active_market)
+    /// is_active_market = true if this is the time-based currently active market
+    pub positions: Vec<(String, LivePositionSummary, bool)>,
 }
 
 /// Paper trading engine
@@ -660,19 +660,29 @@ impl PaperTrader {
     }
 
     /// Get multi-market position summary for UI display
-    /// current_slug: The slug of the current active market
-    /// next_slug: The slug of the upcoming market (if known)
+    /// active_slug: The slug of the time-based currently active market (based on wall clock)
     pub async fn get_multi_market_positions(
         &self,
-        current_slug: Option<&str>,
-        next_slug: Option<&str>,
+        active_slug: Option<&str>,
     ) -> MultiMarketPositions {
         let all_summaries = self.get_all_position_summaries().await;
 
-        MultiMarketPositions {
-            current_market: current_slug.and_then(|slug| all_summaries.get(slug).cloned()),
-            next_market: next_slug.and_then(|slug| all_summaries.get(slug).cloned()),
-        }
+        // Convert to vec and sort by round slug (which contains timestamp)
+        let mut positions: Vec<_> = all_summaries
+            .into_iter()
+            .filter(|(_, summary)| {
+                summary.up_shares > Decimal::ZERO || summary.down_shares > Decimal::ZERO
+            })
+            .map(|(slug, summary)| {
+                let is_active = active_slug.map(|s| s == slug).unwrap_or(false);
+                (slug, summary, is_active)
+            })
+            .collect();
+
+        // Sort by slug (timestamps sort correctly as strings)
+        positions.sort_by(|a, b| a.0.cmp(&b.0));
+
+        MultiMarketPositions { positions }
     }
 
     /// Mark a cycle as abandoned (round changed before completion)
