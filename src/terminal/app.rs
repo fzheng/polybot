@@ -483,12 +483,7 @@ impl App {
                 side
             }
             Ok(None) => {
-                // Market not yet resolved, defer settlement
-                let short_slug = prev.slug.split('-').last().unwrap_or(&prev.slug);
-                self.log(&format!("[{}] Waiting for {} to resolve...",
-                    Local::now().format("%H:%M:%S"),
-                    short_slug
-                ));
+                // Market not yet resolved, defer settlement (don't log to avoid spam)
                 return false;
             }
             Err(e) => {
@@ -572,8 +567,10 @@ impl App {
                 continue;
             }
 
-            // This round has ended and has positions - try to settle
-            self.log(&format!("Settling ended round: {}", slug));
+            // Skip if already in pending settlements (avoid spam)
+            if self.pending_settlements.iter().any(|p| p.slug == slug) {
+                continue;
+            }
 
             // We need to get token IDs for this round
             // Extract them from the slug by querying the API
@@ -590,6 +587,8 @@ impl App {
                     if !self.settle_previous_round(prev.clone()).await {
                         // Add to pending if not yet resolved
                         if !self.pending_settlements.iter().any(|p| p.slug == slug) {
+                            let short_slug = slug.split('-').last().unwrap_or(&slug);
+                            self.log(&format!("Waiting for {} to resolve...", short_slug));
                             self.pending_settlements.push(prev);
                         }
                     }
